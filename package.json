@@ -1,0 +1,17 @@
+{
+  "name": "imap-proxy-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Standalone IMAP proxy server for custom mailbox monitoring",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "imapflow": "^1.0.171",
+    "mailparser": "^3.7.1"
+  }
+}
