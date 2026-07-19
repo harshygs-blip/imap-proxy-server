@@ -2,6 +2,47 @@ import express from 'express';
 import cors from 'cors';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
+import admin from 'firebase-admin';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Initialize Firebase Admin
+const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("Firebase Admin initialized via FIREBASE_SERVICE_ACCOUNT env var.");
+  } catch (err) {
+    console.error("Failed to parse FIREBASE_SERVICE_ACCOUNT environment variable:", err.message);
+  }
+} else if (fs.existsSync(serviceAccountPath)) {
+  try {
+    const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("Firebase Admin initialized via serviceAccountKey.json file.");
+  } catch (err) {
+    console.error("Failed to parse serviceAccountKey.json file:", err.message);
+  }
+} else if (process.env.VITE_FIREBASE_PROJECT_ID) {
+  admin.initializeApp({
+    projectId: process.env.VITE_FIREBASE_PROJECT_ID
+  });
+  console.log("Firebase Admin initialized via VITE_FIREBASE_PROJECT_ID.");
+} else {
+  console.warn("⚠️ Firebase Admin credentials not provided. Database integration will fail unless run in emulator.");
+}
+
+const db = admin.apps.length > 0 ? admin.firestore() : null;
 
 const app = express();
 app.use(cors());
@@ -130,6 +171,135 @@ app.post('/imap/fetch', async (req, res) => {
   } catch (err) {
     console.error('IMAP fetch failed:', err.message);
     res.status(400).json({ error: err.message || 'Failed to fetch messages.' });
+  }
+});
+
+// ============================================================
+// 3. POST /api/license/generate — Auto-generate License Keys via API Key
+// ============================================================
+app.post('/api/license/generate', async (req, res) => {
+  if (!db) {
+    return res.status(500).json({ error: 'Database service is not initialized on the server.' });
+  }
+
+  // 1. Extract API Key from headers (Authorization: Bearer <key> or x-api-key)
+  let apiKey = req.headers['x-api-key'] || '';
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    apiKey = authHeader.substring(7).trim();
+  }
+
+  if (!apiKey) {
+    return res.status(401).json({ error: 'Unauthorized: Missing API Key in Authorization or x-api-key headers.' });
+  }
+
+  try {
+    // 2. Validate API Key from Firestore
+    const apiKeyDoc = await db.collection('api_keys').doc(apiKey).get();
+    if (!apiKeyDoc.exists) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
+    }
+
+    const keyData = apiKeyDoc.data();
+    if (keyData.status !== 'active') {
+      return res.status(403).json({ error: 'Forbidden: API Key has been revoked or is inactive.' });
+    }
+
+    const { assignedMailbox, mailboxType } = req.body;
+    if (!assignedMailbox) {
+      return res.status(400).json({ error: 'Bad Request: Missing required field "assignedMailbox".' });
+    }
+
+    // 3. Generate random 16 character key: XXXX-XXXX-XXXX-XXXX
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let p1 = '', p2 = '', p3 = '', p4 = '';
+    for (let i = 0; i < 4; i++) {
+      p1 += chars.charAt(Math.floor(Math.random() * chars.length));
+      p2 += chars.charAt(Math.floor(Math.random() * chars.length));
+      p3 += chars.charAt(Math.floor(Math.random() * chars.length));
+      p4 += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    const generatedKey = `${p1}-${p2}-${p3}-${p4}`;
+
+    // 4. Save key in Firestore
+    const newLicenseData = {
+      keyId: generatedKey,
+      assignedMailbox: assignedMailbox,
+      mailboxType: mailboxType || 'gmail',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      createdByUid: `api_key_${apiKey}`,
+      createdByEmail: `API Key: ${keyData.label}`,
+      createdByRole: 'api',
+      redeemedBy: null,
+      redeemedAt: null
+    };
+
+    await db.collection('license_keys').doc(generatedKey).set(newLicenseData);
+
+    // 5. Fire webhook if configured
+    const webhookTarget = req.body.webhookUrl || keyData.webhookUrl;
+    if (webhookTarget) {
+      console.log(`Sending webhook notification to: ${webhookTarget}`);
+      const payload = {
+        event: 'license.created',
+        licenseKey: generatedKey,
+        assignedMailbox,
+        mailboxType: mailboxType || 'gmail',
+        createdAt: newLicenseData.createdAt
+      };
+
+      if (typeof fetch !== 'undefined') {
+        fetch(webhookTarget, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }).catch(err => {
+          console.error(`Webhook trigger failed for ${webhookTarget}:`, err.message);
+        });
+      } else {
+        // Fallback using HTTPS module
+        import('https').then((https) => {
+          try {
+            const url = new URL(webhookTarget);
+            const reqData = JSON.stringify(payload);
+            const options = {
+              hostname: url.hostname,
+              port: url.port || 443,
+              path: url.pathname + url.search,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(reqData)
+              }
+            };
+            const wReq = https.request(options, (wRes) => {
+              wRes.on('data', () => {});
+            });
+            wReq.on('error', (err) => {
+              console.error(`Webhook fallback failed for ${webhookTarget}:`, err.message);
+            });
+            wReq.write(reqData);
+            wReq.end();
+          } catch (urlErr) {
+            console.error(`Invalid webhook URL fallback error:`, urlErr.message);
+          }
+        });
+      }
+    }
+
+    // 6. Return response
+    return res.json({
+      success: true,
+      licenseKey: generatedKey,
+      assignedMailbox,
+      mailboxType: mailboxType || 'gmail',
+      status: 'active'
+    });
+
+  } catch (err) {
+    console.error('License Key auto-generation failed:', err);
+    return res.status(500).json({ error: err.message || 'Internal server error during key generation.' });
   }
 });
 
