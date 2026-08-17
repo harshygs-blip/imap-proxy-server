@@ -13,34 +13,68 @@ let _db = null;
 let _auth = null;
 let _adminRef = null;
 const PROJECT_ID = 'ff-store-4a61e';
+const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 
-// Fetch a Firestore doc via REST API (public read - no auth needed, rules allow it)
+// Helper: parse a Firestore REST field value
+function parseField(v) {
+  return v.stringValue ?? v.integerValue ?? v.booleanValue ?? v.doubleValue ?? null;
+}
+
+// Helper: parse a full Firestore REST document into a plain object
+function parseDoc(doc) {
+  const data = {};
+  if (doc.fields) {
+    for (const [k, v] of Object.entries(doc.fields)) {
+      data[k] = parseField(v);
+    }
+  }
+  return data;
+}
+
+// GET single document via REST
 async function firestoreGet(path) {
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(`${FS_BASE}/${path}`, { signal: controller.signal });
     if (res.status === 404) return { exists: false, data: null };
     if (!res.ok) {
-      const body = await res.text().catch(() => res.status);
-      throw new Error(`Firestore ${res.status}: ${String(body).substring(0, 150)}`);
+      const body = await res.text().catch(() => String(res.status));
+      throw new Error(`Firestore GET ${res.status}: ${body.substring(0, 150)}`);
     }
-    const doc = await res.json();
-    const data = {};
-    if (doc.fields) {
-      for (const [k, v] of Object.entries(doc.fields)) {
-        data[k] = v.stringValue ?? v.integerValue ?? v.booleanValue ?? v.doubleValue ?? null;
-      }
-    }
-    return { exists: true, data };
+    return { exists: true, data: parseDoc(await res.json()) };
   } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Firestore request timed out (10s)');
+    if (err.name === 'AbortError') throw new Error('Firestore timed out (10s)');
     throw err;
   } finally {
     clearTimeout(timer);
   }
 }
+
+// LIST all docs in a collection via REST
+async function firestoreList(collection) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const res = await fetch(`${FS_BASE}/${collection}`, { signal: controller.signal });
+    if (!res.ok) {
+      const body = await res.text().catch(() => String(res.status));
+      throw new Error(`Firestore LIST ${res.status}: ${body.substring(0, 150)}`);
+    }
+    const json = await res.json();
+    const docs = json.documents || [];
+    return docs.map(doc => ({
+      id: doc.name.split('/').pop(),
+      data: parseDoc(doc)
+    }));
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Firestore list timed out (12s)');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 // ─────────────────────────────────────────────
 // INIT
@@ -217,12 +251,12 @@ async function startSignup(chatId, licenseKeyId) {
   }
 
 
-  // Check if this chatId already has an active session
+  // Check if this chatId already has an active session (via REST)
   try {
-    const existingSession = await _db.collection('telegram_user_sessions').doc(chatId).get();
+    const existingSession = await firestoreGet(`telegram_user_sessions/${chatId}`);
     if (existingSession.exists) {
-      const sess = existingSession.data();
-      if (Date.now() < (sess.licenseExpiry || 0)) {
+      const sess = existingSession.data;
+      if (Date.now() < (Number(sess.licenseExpiry) || 0)) {
         await sendMsg(chatId,
           `ℹ️ <b>You already have an active account!</b>\n\n` +
           `📧 Mailbox: <code>${sess.assignedMailboxEmail}</code>\n\n` +
@@ -230,16 +264,17 @@ async function startSignup(chatId, licenseKeyId) {
         return;
       }
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* ignore - proceed with signup */ }
 
   // Key valid! Resolve mailbox
   let availableEmail = '';
   try {
     if (keyData.assignedMailbox) {
       availableEmail = keyData.assignedMailbox;
-      const sessionSnap = await _db.collection('telegram_user_sessions')
-        .where('assignedMailboxEmail', '==', availableEmail).get();
-      if (!sessionSnap.empty) {
+      // Check if pre-assigned mailbox already in use (via REST list)
+      const sessions = await firestoreList('telegram_user_sessions');
+      const inUse = sessions.some(s => s.data.assignedMailboxEmail === availableEmail);
+      if (inUse) {
         await sendMsg(chatId, `❌ <b>Mailbox already in use!</b>\n\nContact Admin @example_tgid`);
         return;
       }
@@ -521,16 +556,19 @@ async function handleOtp(chatId) {
 // HELPERS
 // ─────────────────────────────────────────────
 async function findUnassignedMailbox() {
-  const snap = await _db.collection('imap_credentials').get();
-  for (const doc of snap.docs) {
-    const email = doc.data().imap_email;
+  // Use REST API to list imap_credentials - avoids gRPC rate limit
+  const creds = await firestoreList('imap_credentials');
+  const sessions = await firestoreList('telegram_user_sessions');
+  const usedEmails = new Set(sessions.map(s => s.data.assignedMailboxEmail).filter(Boolean));
+
+  for (const cred of creds) {
+    const email = cred.data.imap_email || cred.data.email;
     if (!email) continue;
-    const used = await _db.collection('telegram_user_sessions')
-      .where('assignedMailboxEmail', '==', email).get();
-    if (used.empty) return email;
+    if (!usedEmails.has(email)) return email;
   }
   return null;
 }
+
 
 async function fetchInboxMessages(credData) {
   const client = new ImapFlow({
