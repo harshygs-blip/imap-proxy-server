@@ -142,14 +142,25 @@ async function handleBotMessage(db, message) {
 
     const licenseKeyId = parts[1].trim().toUpperCase();
 
-    // Query Firestore for this key
-    const keyRef = db.collection('telegram_license_keys').doc(licenseKeyId);
-    const keySnap = await keyRef.get();
+    // Query Firestore for this key — wrapped in try/catch for quota/network errors
+    let keySnap;
+    try {
+      const keyRef = db.collection('telegram_license_keys').doc(licenseKeyId);
+      keySnap = await keyRef.get();
+    } catch (dbErr) {
+      console.error('Firestore read error (signup):', dbErr.message);
+      await sendTelegramMessage(chatId,
+        `⚠️ <b>Database temporarily unavailable.</b>\n\n` +
+        `Error: ${dbErr.message}\n\n` +
+        `Please try again in a few minutes or contact Admin @example_tgid.`);
+      return;
+    }
 
     if (!keySnap.exists) {
       await sendTelegramMessage(chatId, `❌ <b>License key not found!</b>\n\nPlease check the spelling or talk to Admin: @example_tgid`);
       return;
     }
+
 
     const keyData = keySnap.data();
     if (keyData.status !== 'active') {
