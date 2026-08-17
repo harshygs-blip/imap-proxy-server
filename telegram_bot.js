@@ -162,21 +162,29 @@ async function handleBotMessage(message) {
 async function startSignup(chatId, licenseKeyId) {
   await sendMsg(chatId, `⏳ Verifying license key <code>${licenseKeyId}</code>...`);
 
-  // Use Firestore REST API instead of Admin SDK gRPC to avoid rate limiting
   const PROJECT_ID = 'ff-store-4a61e';
   let keyData = null;
   let keyExists = false;
 
   try {
+    // Try Firestore REST API first (same as website browser — avoids gRPC rate limits)
     const restUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/telegram_license_keys/${licenseKeyId}`;
-    const restRes = await fetch(restUrl);
+    
+    // 8-second timeout so it never hangs
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let restRes;
+    try {
+      restRes = await fetch(restUrl, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (restRes.status === 404) {
       keyExists = false;
     } else if (restRes.ok) {
       keyExists = true;
       const doc = await restRes.json();
-      // Parse Firestore REST format into plain object
       keyData = {};
       if (doc.fields) {
         for (const [k, v] of Object.entries(doc.fields)) {
@@ -184,15 +192,17 @@ async function startSignup(chatId, licenseKeyId) {
         }
       }
     } else {
-      // REST also failed — try Admin SDK as fallback
-      console.warn('REST API failed, trying Admin SDK:', restRes.status);
+      // REST failed — try Admin SDK fallback
+      console.warn(`REST returned ${restRes.status}, falling back to Admin SDK`);
       const snap = await _db.collection('telegram_license_keys').doc(licenseKeyId).get();
       keyExists = snap.exists;
       if (keyExists) keyData = snap.data();
     }
   } catch (err) {
-    console.error('Key lookup error:', err.message);
-    await sendMsg(chatId, `⚠️ <b>Database error.</b> Please try again in a few minutes.\n\n<i>${err.message}</i>`);
+    const isTimeout = err.name === 'AbortError';
+    const msg = isTimeout ? 'Request timed out' : err.message;
+    console.error('Key lookup error:', msg);
+    await sendMsg(chatId, `⚠️ <b>Database error.</b> Please try again in a few minutes.\n\n<i>${msg}</i>`);
     return;
   }
 
