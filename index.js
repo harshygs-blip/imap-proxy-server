@@ -308,7 +308,7 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ IMAP Proxy Server running on port ${PORT}`);
   // Always start the bot - it handles missing db gracefully
-  initTelegramBot(db, app).catch(err => {
+  initTelegramBot(db, app, admin).catch(err => {
     console.error("Failed to start Telegram Bot:", err);
   });
 });
