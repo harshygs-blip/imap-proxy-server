@@ -138,9 +138,25 @@ async function handleBotMessage(db, message) {
       return;
     }
 
-    // Key is valid! Find an unassigned Garena mailbox
+    // Key is valid! Resolve Garena mailbox
     await sendTelegramMessage(chatId, `⏳ Validating key and allocating secure mailbox...`);
-    const availableEmail = await findUnassignedMailbox(db);
+    
+    let availableEmail = '';
+    if (keyData.assignedMailbox) {
+      availableEmail = keyData.assignedMailbox;
+      
+      // Check if this mailbox is already in use by another Telegram session
+      const sessionSnap = await db.collection('telegram_user_sessions')
+        .where('assignedMailboxEmail', '==', availableEmail)
+        .get();
+        
+      if (!sessionSnap.empty) {
+        await sendTelegramMessage(chatId, `❌ <b>Mailbox is currently active in another session!</b>\n\nThis specific Garena mailbox (<code>${availableEmail}</code>) is already linked to another active client. Please talk to Admin @example_tgid.`);
+        return;
+      }
+    } else {
+      availableEmail = await findUnassignedMailbox(db);
+    }
     
     if (!availableEmail) {
       await sendTelegramMessage(chatId, `⚠️ <b>No mailboxes available!</b>\n\nAll Garena mailboxes are currently assigned. Please contact Admin @example_tgid to restock.`);
