@@ -11,12 +11,54 @@ const pendingSignups = new Map();
 
 let _db = null;
 let _auth = null;
+let _adminRef = null;
+const PROJECT_ID = 'ff-store-4a61e';
+
+// Get Firebase access token from service account (for authenticated REST calls)
+async function getFirebaseToken() {
+  if (!_adminRef || !_adminRef.apps || !_adminRef.apps.length) return null;
+  try {
+    const tokenResult = await _adminRef.app().options.credential.getAccessToken();
+    return tokenResult.access_token;
+  } catch (e) {
+    console.warn('Could not get Firebase access token:', e.message);
+    return null;
+  }
+}
+
+// Fetch a Firestore doc via REST API with auth token
+async function firestoreGet(path) {
+  const token = await getFirebaseToken();
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}`;
+  const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(url, { headers, signal: controller.signal });
+    if (res.status === 404) return { exists: false, data: null };
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Firestore REST ${res.status}: ${body.substring(0, 200)}`);
+    }
+    const doc = await res.json();
+    const data = {};
+    if (doc.fields) {
+      for (const [k, v] of Object.entries(doc.fields)) {
+        data[k] = v.stringValue ?? v.integerValue ?? v.booleanValue ?? v.doubleValue ?? null;
+      }
+    }
+    return { exists: true, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ─────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────
 export async function initTelegramBot(db, app, admin) {
   _db = db;
+  _adminRef = admin;
   _auth = admin && admin.apps && admin.apps.length > 0 ? admin.auth() : null;
 
   // Verify token
@@ -162,47 +204,16 @@ async function handleBotMessage(message) {
 async function startSignup(chatId, licenseKeyId) {
   await sendMsg(chatId, `⏳ Verifying license key <code>${licenseKeyId}</code>...`);
 
-  const PROJECT_ID = 'ff-store-4a61e';
-  let keyData = null;
   let keyExists = false;
+  let keyData = null;
 
   try {
-    // Try Firestore REST API first (same as website browser — avoids gRPC rate limits)
-    const restUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/telegram_license_keys/${licenseKeyId}`;
-    
-    // 8-second timeout so it never hangs
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    let restRes;
-    try {
-      restRes = await fetch(restUrl, { signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-
-    if (restRes.status === 404) {
-      keyExists = false;
-    } else if (restRes.ok) {
-      keyExists = true;
-      const doc = await restRes.json();
-      keyData = {};
-      if (doc.fields) {
-        for (const [k, v] of Object.entries(doc.fields)) {
-          keyData[k] = v.stringValue ?? v.integerValue ?? v.booleanValue ?? v.doubleValue ?? null;
-        }
-      }
-    } else {
-      // REST failed — try Admin SDK fallback
-      console.warn(`REST returned ${restRes.status}, falling back to Admin SDK`);
-      const snap = await _db.collection('telegram_license_keys').doc(licenseKeyId).get();
-      keyExists = snap.exists;
-      if (keyExists) keyData = snap.data();
-    }
+    const result = await firestoreGet(`telegram_license_keys/${licenseKeyId}`);
+    keyExists = result.exists;
+    keyData = result.data;
   } catch (err) {
-    const isTimeout = err.name === 'AbortError';
-    const msg = isTimeout ? 'Request timed out' : err.message;
-    console.error('Key lookup error:', msg);
-    await sendMsg(chatId, `⚠️ <b>Database error.</b> Please try again in a few minutes.\n\n<i>${msg}</i>`);
+    console.error('Key lookup error:', err.message);
+    await sendMsg(chatId, `⚠️ <b>Database error.</b> Please try again.\n\n<i>${err.message}</i>`);
     return;
   }
 
@@ -215,6 +226,7 @@ async function startSignup(chatId, licenseKeyId) {
     await sendMsg(chatId, `❌ <b>Key already redeemed!</b>\n\nContact Admin @example_tgid`);
     return;
   }
+
 
   // Check if this chatId already has an active session
   try {
