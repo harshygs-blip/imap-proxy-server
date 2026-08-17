@@ -162,21 +162,45 @@ async function handleBotMessage(message) {
 async function startSignup(chatId, licenseKeyId) {
   await sendMsg(chatId, `⏳ Verifying license key <code>${licenseKeyId}</code>...`);
 
-  let keySnap;
+  // Use Firestore REST API instead of Admin SDK gRPC to avoid rate limiting
+  const PROJECT_ID = 'ff-store-4a61e';
+  let keyData = null;
+  let keyExists = false;
+
   try {
-    keySnap = await _db.collection('telegram_license_keys').doc(licenseKeyId).get();
+    const restUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/telegram_license_keys/${licenseKeyId}`;
+    const restRes = await fetch(restUrl);
+
+    if (restRes.status === 404) {
+      keyExists = false;
+    } else if (restRes.ok) {
+      keyExists = true;
+      const doc = await restRes.json();
+      // Parse Firestore REST format into plain object
+      keyData = {};
+      if (doc.fields) {
+        for (const [k, v] of Object.entries(doc.fields)) {
+          keyData[k] = v.stringValue ?? v.integerValue ?? v.booleanValue ?? v.doubleValue ?? null;
+        }
+      }
+    } else {
+      // REST also failed — try Admin SDK as fallback
+      console.warn('REST API failed, trying Admin SDK:', restRes.status);
+      const snap = await _db.collection('telegram_license_keys').doc(licenseKeyId).get();
+      keyExists = snap.exists;
+      if (keyExists) keyData = snap.data();
+    }
   } catch (err) {
-    console.error('Firestore error (key lookup):', err.message);
+    console.error('Key lookup error:', err.message);
     await sendMsg(chatId, `⚠️ <b>Database error.</b> Please try again in a few minutes.\n\n<i>${err.message}</i>`);
     return;
   }
 
-  if (!keySnap.exists) {
+  if (!keyExists || !keyData) {
     await sendMsg(chatId, `❌ <b>License key not found!</b>\n\nCheck spelling or contact Admin @example_tgid`);
     return;
   }
 
-  const keyData = keySnap.data();
   if (keyData.status !== 'active') {
     await sendMsg(chatId, `❌ <b>Key already redeemed!</b>\n\nContact Admin @example_tgid`);
     return;
