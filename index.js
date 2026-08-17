@@ -3,6 +3,7 @@ import cors from 'cors';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import admin from 'firebase-admin';
+import { initTelegramBot } from './telegram_bot.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -306,4 +307,9 @@ app.post('/api/license/generate', async (req, res) => {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ IMAP Proxy Server running on port ${PORT}`);
+  if (db) {
+    initTelegramBot(db).catch(err => {
+      console.error("Failed to start Telegram Bot:", err);
+    });
+  }
 });
