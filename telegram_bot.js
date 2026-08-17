@@ -14,31 +14,17 @@ let _auth = null;
 let _adminRef = null;
 const PROJECT_ID = 'ff-store-4a61e';
 
-// Get Firebase access token from service account (for authenticated REST calls)
-async function getFirebaseToken() {
-  if (!_adminRef || !_adminRef.apps || !_adminRef.apps.length) return null;
-  try {
-    const tokenResult = await _adminRef.app().options.credential.getAccessToken();
-    return tokenResult.access_token;
-  } catch (e) {
-    console.warn('Could not get Firebase access token:', e.message);
-    return null;
-  }
-}
-
-// Fetch a Firestore doc via REST API with auth token
+// Fetch a Firestore doc via REST API (public read - no auth needed, rules allow it)
 async function firestoreGet(path) {
-  const token = await getFirebaseToken();
   const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}`;
-  const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(url, { headers, signal: controller.signal });
+    const res = await fetch(url, { signal: controller.signal });
     if (res.status === 404) return { exists: false, data: null };
     if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Firestore REST ${res.status}: ${body.substring(0, 200)}`);
+      const body = await res.text().catch(() => res.status);
+      throw new Error(`Firestore ${res.status}: ${String(body).substring(0, 150)}`);
     }
     const doc = await res.json();
     const data = {};
@@ -48,6 +34,9 @@ async function firestoreGet(path) {
       }
     }
     return { exists: true, data };
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Firestore request timed out (10s)');
+    throw err;
   } finally {
     clearTimeout(timer);
   }
