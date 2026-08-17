@@ -135,6 +135,11 @@ async function handleBotMessage(db, message) {
       return;
     }
 
+    if (!db) {
+      await sendTelegramMessage(chatId, `⚠️ <b>Server database is not connected yet.</b>\n\nPlease try again in 2 minutes.`);
+      return;
+    }
+
     const licenseKeyId = parts[1].trim().toUpperCase();
 
     // Query Firestore for this key

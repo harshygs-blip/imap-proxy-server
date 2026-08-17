@@ -307,9 +307,8 @@ app.post('/api/license/generate', async (req, res) => {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ IMAP Proxy Server running on port ${PORT}`);
-  if (db) {
-    initTelegramBot(db, app).catch(err => {
-      console.error("Failed to start Telegram Bot:", err);
-    });
-  }
+  // Always start the bot - it handles missing db gracefully
+  initTelegramBot(db, app).catch(err => {
+    console.error("Failed to start Telegram Bot:", err);
+  });
 });
