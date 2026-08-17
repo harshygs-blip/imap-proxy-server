@@ -102,22 +102,39 @@ async function handleBotMessage(db, message) {
 
   // 1. GREETING / START COMMAND
   if (lowerText === '/start' || lowerText === 'hi' || lowerText === 'hello') {
-    const welcomeMsg = 
+    const welcomeMsg =
       `👋 <b>Welcome to Garena OTP Assistant!</b>\n\n` +
-      `I will help you receive game OTPs instantly inside Telegram.\n\n` +
-      `👉 To link your account, please register using your <b>Telegram License Key</b>:\n` +
-      `Type: <code>signup &lt;YOUR_LICENSE_KEY&gt;</code>\n\n` +
-      `👉 Once registered, you can retrieve your Garena OTP by typing:\n` +
-      `Type: <code>otp</code>`;
+      `I help you receive Garena game OTPs instantly inside Telegram.\n\n` +
+      `<b>How to get started:</b>\n` +
+      `1️⃣ Type <code>signup YOUR_LICENSE_KEY</code>\n` +
+      `   Example: <code>signup TG-9QH7MYR5</code>\n\n` +
+      `2️⃣ Copy the assigned email address and use it on Garena\n\n` +
+      `3️⃣ After Garena sends OTP, type <code>otp</code> to get your code\n\n` +
+      `⚠️ <i>Limit: 1 OTP per 48 hours</i>`;
     await sendTelegramMessage(chatId, welcomeMsg);
     return;
   }
 
-  // 2. SIGNUP FLOW (signup <key> or /signup <key>)
+  // 2. BARE KEY DETECTION — user pastes key directly like "TG-9QH7MYR5"
+  const upperText = text.toUpperCase().trim();
+  if (/^TG-[A-Z0-9]+$/.test(upperText)) {
+    // Treat as signup attempt with this key
+    await sendTelegramMessage(chatId,
+      `🔑 <b>License key detected!</b>\n\n` +
+      `To activate key <code>${upperText}</code>, please type:\n` +
+      `<code>signup ${upperText}</code>\n\n` +
+      `<i>Just add "signup" before the key and send again.</i>`);
+    return;
+  }
+
+  // 3. SIGNUP FLOW (signup <key> or /signup <key>)
   if (lowerText.startsWith('signup') || lowerText.startsWith('/signup')) {
-    const parts = text.split(/\s+/);
+    const parts = text.trim().split(/\s+/);
     if (parts.length < 2) {
-      await sendTelegramMessage(chatId, `⚠️ <b>Invalid format!</b>\n\nPlease send your key as:\n<code>signup TG-XXXX-XXXX</code>`);
+      await sendTelegramMessage(chatId,
+        `⚠️ <b>Please include your license key!</b>\n\n` +
+        `Format: <code>signup TG-XXXXXXXX</code>\n` +
+        `Example: <code>signup TG-9QH7MYR5</code>`);
       return;
     }
     
