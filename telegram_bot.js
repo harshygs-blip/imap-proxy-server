@@ -385,20 +385,51 @@ async function handleSignupConversation(chatId, text) {
         });
       }
 
-      // Create Firestore user document (same as website)
+      // Create Firestore user document — same schema as website's createClientRecord
       const expiryTime = Date.now() + (Number(state.keyData.validityDays || 2) * 24 * 60 * 60 * 1000);
       const uid = firebaseUser ? firebaseUser.uid : `tg_${chatId}`;
+      const now = new Date();
+      const expiryDate = new Date(expiryTime);
 
+      // 1. users/{uid} — matches website's user document schema
       await _db.collection('users').doc(uid).set({
         uid,
+        role: 'client',
         name: displayName,
         email: state.email,
-        role: 'client',
-        assignedMailbox: state.availableEmail,
-        createdAt: Date.now(),
+        mobile: '',
+        linkedGmail: '',
+        linkedZoho: '',
+        linkedImap: state.availableEmail,   // assigned Garena mailbox
+        bindingStatus: 'none',
+        bindingStartDate: null,
+        bindingEmail: '',
+        mailboxDisabled: false,
+        mailboxDisabledReason: '',
+        initialPassword: password,
+        warningDismissed: false,
+        assignedAdminId: null,
         source: 'telegram',
-        telegramChatId: chatId
+        telegramChatId: chatId,
+        createdAt: now
       });
+
+      // 2. subscriptions/{uid} — required for getAllClients to show user in dashboard
+      await _db.collection('subscriptions').doc(uid).set({
+        uid,
+        productName: 'Garena OTP Bot',
+        purchaseDate: now,
+        expiryDate: expiryDate,
+        validityDays: Number(state.keyData.validityDays || 2),
+        amountPaid: Number(state.keyData.price || 0),
+        remainingBalance: 0,
+        commission: 0,
+        commissionPaid: 0,
+        status: 'Active',
+        notes: `Signed up via Telegram Bot. License: ${state.keyId}`,
+        updatedAt: now
+      });
+
 
       // Create Telegram session
       await _db.collection('telegram_user_sessions').doc(chatId).set({
