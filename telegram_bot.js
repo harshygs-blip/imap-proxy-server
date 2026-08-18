@@ -266,20 +266,22 @@ async function startSignup(chatId, licenseKeyId) {
   }
 
 
-  // Check if this chatId already has an active session (via REST)
+  // Check if this chatId already has an active session (Admin SDK - bypasses rules)
   try {
-    const existingSession = await firestoreGet(`telegram_user_sessions/${chatId}`);
-    if (existingSession.exists) {
-      const sess = existingSession.data;
-      if (Date.now() < (Number(sess.licenseExpiry) || 0)) {
-        await sendMsg(chatId,
-          `ℹ️ <b>You already have an active account!</b>\n\n` +
-          `📧 Current Mailbox: <code>${sess.assignedMailboxEmail}</code>\n\n` +
-          `To switch to a new license, type <code>logout</code> first, then signup again.`);
-        return;
+    if (_db) {
+      const existingSession = await _db.collection('telegram_user_sessions').doc(chatId).get();
+      if (existingSession.exists) {
+        const sess = existingSession.data();
+        if (Date.now() < (Number(sess.licenseExpiry) || 0)) {
+          await sendMsg(chatId,
+            `ℹ️ <b>You already have an active account!</b>\n\n` +
+            `📧 Current Mailbox: <code>${sess.assignedMailboxEmail}</code>\n\n` +
+            `To switch to a new license, type <code>logout</code> first, then signup again.`);
+          return;
+        }
+        // Expired session - auto-clear
+        await _db.collection('telegram_user_sessions').doc(chatId).delete().catch(() => {});
       }
-      // Expired session - auto-clear and let them signup fresh
-      await _db.collection('telegram_user_sessions').doc(chatId).delete().catch(() => {});
     }
   } catch (e) { /* ignore - proceed with signup */ }
 
@@ -288,12 +290,14 @@ async function startSignup(chatId, licenseKeyId) {
   try {
     if (keyData.assignedMailbox) {
       availableEmail = keyData.assignedMailbox;
-      // Check if pre-assigned mailbox already in use (via REST list)
-      const sessions = await firestoreList('telegram_user_sessions');
-      const inUse = sessions.some(s => s.data.assignedMailboxEmail === availableEmail);
-      if (inUse) {
-        await sendMsg(chatId, `❌ <b>Mailbox already in use!</b>\n\nContact Admin @example_tgid`);
-        return;
+      // Check if pre-assigned mailbox already in use (Admin SDK)
+      if (_db) {
+        const sessSnap = await _db.collection('telegram_user_sessions')
+          .where('assignedMailboxEmail', '==', availableEmail).get();
+        if (!sessSnap.empty) {
+          await sendMsg(chatId, `❌ <b>Mailbox already in use!</b>\n\nContact Admin @example_tgid`);
+          return;
+        }
       }
     } else {
       availableEmail = await findUnassignedMailbox();
@@ -624,13 +628,16 @@ async function handleOtp(chatId) {
 // HELPERS
 // ─────────────────────────────────────────────
 async function findUnassignedMailbox() {
-  // Use Admin SDK (gRPC) for imap_credentials — REST is blocked by Firestore rules (admin-only read)
-  // Admin SDK bypasses security rules
-  const snap = await _db.collection('imap_credentials').get();
-  const sessions = await firestoreList('telegram_user_sessions'); // REST OK (public read rule)
-  const usedEmails = new Set(sessions.map(s => s.data.assignedMailboxEmail).filter(Boolean));
+  // Both reads use Admin SDK — bypasses Firestore rules, no 403 issues
+  const credSnap = await _db.collection('imap_credentials').get();
+  const sessSnap = await _db.collection('telegram_user_sessions').get();
+  const usedEmails = new Set();
+  sessSnap.forEach(d => {
+    const e = d.data().assignedMailboxEmail;
+    if (e) usedEmails.add(e);
+  });
 
-  for (const doc of snap.docs) {
+  for (const doc of credSnap.docs) {
     const data = doc.data();
     const email = data.imap_email || data.email;
     if (!email) continue;
