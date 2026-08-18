@@ -51,29 +51,8 @@ async function firestoreGet(path) {
   }
 }
 
-// LIST all docs in a collection via REST
-async function firestoreList(collection) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
-  try {
-    const res = await fetch(`${FS_BASE}/${collection}`, { signal: controller.signal });
-    if (!res.ok) {
-      const body = await res.text().catch(() => String(res.status));
-      throw new Error(`Firestore LIST ${res.status}: ${body.substring(0, 150)}`);
-    }
-    const json = await res.json();
-    const docs = json.documents || [];
-    return docs.map(doc => ({
-      id: doc.name.split('/').pop(),
-      data: parseDoc(doc)
-    }));
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Firestore list timed out (12s)');
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-}
+
+
 
 
 // ─────────────────────────────────────────────
@@ -542,12 +521,14 @@ async function handleOtp(chatId) {
   let credData = null;
 
   try {
-    // Use REST list to find credentials (avoids gRPC rate limit)
-    const allCreds = await firestoreList('imap_credentials');
-    const found = allCreds.find(c =>
-      c.data.imap_email === mailboxEmail || c.data.email === mailboxEmail
-    );
-    if (found) credData = found.data;
+    // Use Admin SDK (_db) — bypasses Firestore security rules completely, zero 403 errors
+    const snap = await _db.collection('imap_credentials').where('imap_email', '==', mailboxEmail).get();
+    if (!snap.empty) {
+      snap.forEach(d => { credData = d.data(); });
+    } else {
+      const snap2 = await _db.collection('imap_credentials').where('email', '==', mailboxEmail).get();
+      if (!snap2.empty) snap2.forEach(d => { credData = d.data(); });
+    }
   } catch (err) {
     await sendMsg(chatId, `❌ <b>Credential lookup failed.</b>\n<i>${err.message}</i>`);
     return;
