@@ -456,7 +456,7 @@ async function handleOtp(chatId) {
 
   let userSessionSnap;
   try {
-    userSessionSnap = await _db.collection('telegram_user_sessions').doc(chatId).get();
+    userSessionSnap = await firestoreGet(`telegram_user_sessions/${chatId}`);
   } catch (err) {
     await sendMsg(chatId, `⚠️ <b>Database error.</b> Try again.\n<i>${err.message}</i>`);
     return;
@@ -468,7 +468,7 @@ async function handleOtp(chatId) {
     return;
   }
 
-  const session = userSessionSnap.data();
+  const session = userSessionSnap.data;
 
   if (Date.now() > (session.licenseExpiry || 0)) {
     await sendMsg(chatId,
@@ -495,32 +495,33 @@ async function handleOtp(chatId) {
   let credData = null;
 
   try {
-    // Check all credential collections
-    for (const col of ['imap_credentials', 'gmail_credentials', 'zoho_credentials']) {
-      const snap = await _db.collection(col).where('imap_email', '==', mailboxEmail).get();
-      if (!snap.empty) { snap.forEach(d => { credData = d.data(); }); break; }
-      // Also try email field for gmail/zoho
-      const snap2 = await _db.collection(col).where('email', '==', mailboxEmail).get();
-      if (!snap2.empty) { snap2.forEach(d => { credData = d.data(); }); break; }
-    }
+    // Use REST list to find credentials (avoids gRPC rate limit)
+    const allCreds = await firestoreList('imap_credentials');
+    const found = allCreds.find(c =>
+      c.data.imap_email === mailboxEmail || c.data.email === mailboxEmail
+    );
+    if (found) credData = found.data;
   } catch (err) {
     await sendMsg(chatId, `❌ <b>Credential lookup failed.</b>\n<i>${err.message}</i>`);
     return;
   }
 
   if (!credData) {
-    await sendMsg(chatId, `❌ <b>Mailbox credentials not found!</b> Contact Admin.`);
+    await sendMsg(chatId, `❌ <b>Mailbox credentials not found!</b>\n\nAdmin needs to add <code>${mailboxEmail}</code> to Email Monitor.`);
     return;
   }
 
   try {
     const messages = await fetchInboxMessages(credData);
+
+    // Filter Garena emails
     const garenaMsgs = messages.filter(m => {
       const f = (m.sender || '').toLowerCase();
       const s = (m.subject || '').toLowerCase();
-      const b = (m.body || m.summary || '').toLowerCase();
-      return f.includes('garena') || s.includes('garena') || b.includes('garena') ||
-             s.includes('otp') || s.includes('verification') || s.includes('verify');
+      const b = (m.body || '').toLowerCase();
+      return f.includes('garena') || f.includes('account@garena') ||
+             s.includes('garena') || s.includes('verification') ||
+             b.includes('garena') || b.includes('verification code');
     });
 
     if (garenaMsgs.length === 0) {
@@ -529,26 +530,45 @@ async function handleOtp(chatId) {
       return;
     }
 
+    // Sort newest first
     garenaMsgs.sort((a, b) => Number(b.sentTime || 0) - Number(a.sentTime || 0));
     const latest = garenaMsgs[0];
-    const target = `${latest.subject} ${latest.body || latest.summary || ''}`;
-    const match = target.match(/\b(\d{4,8})\b/);
+    const bodyText = latest.body || '';
 
-    if (!match) {
+    // Garena OTP: standalone 6-8 digit number on its own line
+    // e.g. "51137492" appears alone on a line
+    const match =
+      bodyText.match(/^\s*(\d{6,8})\s*$/m) ||   // standalone on its own line
+      bodyText.match(/code[:\s]+([\s\n]*(\d{6,8}))/i) ||  // after word "code"
+      bodyText.match(/\b(\d{6,8})\b/);           // anywhere as fallback
+
+    const otp = match ? (match[2] || match[1]) : null;
+
+    if (!otp) {
+      // Show raw email so user can manually read it
+      const preview = bodyText.replace(/\s+/g, ' ').trim().substring(0, 500);
       await sendMsg(chatId,
-        `⚠️ <b>Email received but no OTP found!</b>\n\nSubject: ${latest.subject}\n\nResend OTP and try again.`);
+        `⚠️ <b>OTP auto-extract failed!</b>\n\n` +
+        `📧 <b>Latest Garena Email:</b>\n` +
+        `<i>From:</i> ${latest.sender}\n` +
+        `<i>Subject:</i> ${latest.subject}\n\n` +
+        `<pre>${preview}</pre>\n\n` +
+        `Copy the code manually from above ☝️`);
       return;
     }
 
-    await _db.collection('telegram_user_sessions').doc(chatId).update({ lastOtpFetchedAt: Date.now() });
+    // Update last OTP fetch time
+    try {
+      await _db.collection('telegram_user_sessions').doc(chatId).update({ lastOtpFetchedAt: Date.now() });
+    } catch (e) { /* non-critical */ }
 
     await sendMsg(chatId,
       `🔑 <b>Your Garena OTP:</b>\n\n` +
-      `<code>${match[1]}</code>\n\n` +
+      `<code>${otp}</code>\n\n` +
       `👆 Tap to copy. Limit locked for next 48 hours.`);
 
   } catch (err) {
-    await sendMsg(chatId, `❌ <b>Mailbox error!</b>\n<i>${err.message}</i>`);
+    await sendMsg(chatId, `❌ <b>Mailbox connection error!</b>\n\n<i>${err.message}</i>\n\nCheck if App Password is correct in Email Monitor.`);
   }
 }
 
