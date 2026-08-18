@@ -609,15 +609,26 @@ async function handleOtp(chatId) {
       return;
     }
 
-    // Update last OTP fetch time
+    // Update last OTP fetch time AND auto-unlink mailbox after 1-time scan
     try {
-      await _db.collection('telegram_user_sessions').doc(chatId).update({ lastOtpFetchedAt: Date.now() });
-    } catch (e) { /* non-critical */ }
+      await _db.collection('telegram_user_sessions').doc(chatId).update({
+        lastOtpFetchedAt: Date.now(),
+        assignedMailboxEmail: ''
+      });
+      if (session.uid) {
+        await _db.collection('users').doc(session.uid).update({
+          linkedImap: '',
+          linkedGmail: '',
+          linkedZoho: ''
+        });
+      }
+    } catch (e) { console.error('Auto-unlink error:', e.message); }
 
     await sendMsg(chatId,
       `🔑 <b>Your Garena OTP:</b>\n\n` +
       `<code>${otp}</code>\n\n` +
-      `👆 Tap to copy. Limit locked for next 48 hours.`);
+      `👆 Tap to copy.\n` +
+      `<i>⚡ Mailbox automatically unlinked from console after 1-time OTP scan.</i>`);
 
   } catch (err) {
     await sendMsg(chatId, `❌ <b>Mailbox connection error!</b>\n\n<i>${err.message}</i>\n\nCheck if App Password is correct in Email Monitor.`);
