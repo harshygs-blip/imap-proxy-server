@@ -591,34 +591,37 @@ async function findUnassignedMailbox() {
 
 
 async function fetchInboxMessages(credData) {
-  const client = new ImapFlow({
-    host: credData.imap_host,
-    port: parseInt(credData.imap_port) || 993,
-    secure: credData.imap_secure !== false,
-    auth: { user: credData.imap_user || credData.email, pass: credData.imap_password || credData.password },
-    logger: false
+  // Call the same /imap/fetch endpoint that the website uses
+  // This guarantees identical behavior - no duplicate ImapFlow code
+  const PORT = process.env.PORT || 8080;
+  const res = await fetch(`http://localhost:${PORT}/imap/fetch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      host: credData.imap_host,
+      port: credData.imap_port,
+      user: credData.imap_user || credData.imap_email,   // website uses imap_user
+      pass: credData.imap_password,
+      secure: credData.imap_secure !== false,
+      folders: ['INBOX'],
+      limit: 15
+    })
   });
 
-  await client.connect();
-  const msgs = [];
-  try {
-    const lock = await client.getMailboxLock('INBOX');
-    try {
-      const total = client.mailbox.exists || 0;
-      if (total > 0) {
-        const range = `${Math.max(1, total - 14)}:*`;
-        for await (const msg of client.fetch(range, { envelope: true, source: true })) {
-          const parsed = await simpleParser(msg.source);
-          msgs.push({
-            subject: msg.envelope.subject || '',
-            sender: msg.envelope.from?.value?.map(f => f.address).join(', ') || '',
-            sentTime: msg.envelope.date?.getTime() || Date.now(),
-            body: parsed.text || '',
-            summary: parsed.textAsHtml || ''
-          });
-        }
-      }
-    } finally { lock.release(); }
-  } finally { await client.logout(); }
-  return msgs;
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.status }));
+    throw new Error(err.error || `IMAP fetch failed: ${res.status}`);
+  }
+
+  const data = await res.json();
+  const messages = data.data || [];
+
+  return messages.map(m => ({
+    subject: m.subject || '',
+    sender: m.sender || m.from || '',
+    sentTime: m.sentTime || m.date || Date.now(),
+    body: m.text || m.body || m.snippet || '',
+    summary: m.summary || m.snippet || ''
+  }));
 }
+
