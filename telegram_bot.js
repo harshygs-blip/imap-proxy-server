@@ -200,6 +200,20 @@ async function handleBotMessage(message) {
     return;
   }
 
+  // ── Logout ──
+  if (lower === 'logout' || lower === '/logout') {
+    pendingSignups.delete(chatId);
+    if (!_db) { await sendMsg(chatId, `❌ Server not ready.`); return; }
+    try {
+      await _db.collection('telegram_user_sessions').doc(chatId).delete();
+    } catch(e) { /* ignore */ }
+    await sendMsg(chatId,
+      `✅ <b>Logged out successfully!</b>\n\n` +
+      `You can now signup with a new license key:\n` +
+      `<code>signup TG-XXXXXXXX</code>`);
+    return;
+  }
+
   // ── OTP command ──
   if (lower === 'otp' || lower === '/otp') {
     await handleOtp(chatId);
@@ -218,6 +232,7 @@ async function handleBotMessage(message) {
     `❓ <b>Unknown command.</b>\n\n` +
     `• <code>signup TG-XXXXXXXX</code> — Register license key\n` +
     `• <code>otp</code> — Get your Garena OTP\n` +
+    `• <code>logout</code> — Switch to a different license\n` +
     `• <code>cancel</code> — Cancel current action`);
 }
 
@@ -259,10 +274,12 @@ async function startSignup(chatId, licenseKeyId) {
       if (Date.now() < (Number(sess.licenseExpiry) || 0)) {
         await sendMsg(chatId,
           `ℹ️ <b>You already have an active account!</b>\n\n` +
-          `📧 Mailbox: <code>${sess.assignedMailboxEmail}</code>\n\n` +
-          `Type <code>otp</code> to get your code.`);
+          `📧 Current Mailbox: <code>${sess.assignedMailboxEmail}</code>\n\n` +
+          `To switch to a new license, type <code>logout</code> first, then signup again.`);
         return;
       }
+      // Expired session - auto-clear and let them signup fresh
+      await _db.collection('telegram_user_sessions').doc(chatId).delete().catch(() => {});
     }
   } catch (e) { /* ignore - proceed with signup */ }
 
@@ -607,13 +624,15 @@ async function handleOtp(chatId) {
 // HELPERS
 // ─────────────────────────────────────────────
 async function findUnassignedMailbox() {
-  // Use REST API to list imap_credentials - avoids gRPC rate limit
-  const creds = await firestoreList('imap_credentials');
-  const sessions = await firestoreList('telegram_user_sessions');
+  // Use Admin SDK (gRPC) for imap_credentials — REST is blocked by Firestore rules (admin-only read)
+  // Admin SDK bypasses security rules
+  const snap = await _db.collection('imap_credentials').get();
+  const sessions = await firestoreList('telegram_user_sessions'); // REST OK (public read rule)
   const usedEmails = new Set(sessions.map(s => s.data.assignedMailboxEmail).filter(Boolean));
 
-  for (const cred of creds) {
-    const email = cred.data.imap_email || cred.data.email;
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    const email = data.imap_email || data.email;
     if (!email) continue;
     if (!usedEmails.has(email)) return email;
   }
