@@ -528,17 +528,12 @@ async function handleOtp(chatId) {
     return;
   }
 
-  if (session.lastOtpFetchedAt) {
-    const diff = Date.now() - session.lastOtpFetchedAt;
-    const limit = 48 * 60 * 60 * 1000;
-    if (diff < limit) {
-      const remaining = limit - diff;
-      const hrs = Math.floor(remaining / 3600000);
-      const mins = Math.floor((remaining % 3600000) / 60000);
-      await sendMsg(chatId,
-        `⚠️ <b>Limit reached!</b>\n\n1 OTP per 48 hours.\n\n⏳ Try again after: <b>${hrs}h ${mins}m</b>`);
-      return;
-    }
+  if (session.otpUsed || !session.assignedMailboxEmail) {
+    await sendMsg(chatId,
+      `🔒 <b>OTP Already Scanned! (1/1 Limit Reached)</b>\n\n` +
+      `Your 1-time OTP scan for this license key has been completed and the console mailbox is now locked & unlinked.\n\n` +
+      `To get another OTP, type <code>logout</code>, then register a new license key: <code>signup TG-XXXXXXXX</code>.`);
+    return;
   }
 
   await sendMsg(chatId, `🔍 Fetching your OTP from mailbox...`);
@@ -609,17 +604,23 @@ async function handleOtp(chatId) {
       return;
     }
 
-    // Update last OTP fetch time AND auto-unlink mailbox after 1-time scan
+    // Update last OTP fetch time, increment scan count AND auto-unlink mailbox after 1-time scan
+    const newCount = (Number(session.otpScanCount) || 0) + 1;
     try {
       await _db.collection('telegram_user_sessions').doc(chatId).update({
         lastOtpFetchedAt: Date.now(),
+        otpUsed: true,
+        otpScanCount: newCount,
         assignedMailboxEmail: ''
       });
       if (session.uid) {
         await _db.collection('users').doc(session.uid).update({
           linkedImap: '',
           linkedGmail: '',
-          linkedZoho: ''
+          linkedZoho: '',
+          otpUsed: true,
+          otpScanCount: newCount,
+          lastOtpScannedAt: Date.now()
         });
       }
     } catch (e) { console.error('Auto-unlink error:', e.message); }
