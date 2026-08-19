@@ -116,25 +116,32 @@ function trackMsg(chatId, msgId) {
   chatHistory.get(chatId).add(msgId);
 }
 
-// Function to delete all conversation messages from both client and bot side
-async function clearChat(chatId) {
-  const set = chatHistory.get(chatId);
-  if (!set || set.size === 0) return;
-  const msgIds = Array.from(set);
+// Function to delete all conversation messages from both client and bot side (makes chat look brand new!)
+async function clearChat(chatId, latestMsgId = null) {
+  const set = chatHistory.get(chatId) || new Set();
   chatHistory.delete(chatId);
 
-  // Try bulk delete first (Telegram API 7.0+)
+  // Deep sweep: include range of recent message IDs to ensure 100% clean chat
+  if (latestMsgId) {
+    const start = Math.max(1, Number(latestMsgId) - 60);
+    for (let id = start; id <= Number(latestMsgId); id++) {
+      set.add(id);
+    }
+  }
+
+  const msgIds = Array.from(set);
+  if (msgIds.length === 0) return;
+
+  // Try bulk delete (Telegram API 7.0+)
   try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/deleteMessages`, {
+    await fetch(`https://api.telegram.org/bot${botToken}/deleteMessages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, message_ids: msgIds })
     });
-    const data = await res.json();
-    if (data.ok) return;
-  } catch (e) { /* fallback to single delete */ }
+  } catch (e) { /* fallback */ }
 
-  // Fallback: delete messages one by one
+  // Fallback single delete
   for (const id of msgIds) {
     try {
       await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
@@ -142,7 +149,7 @@ async function clearChat(chatId) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, message_id: id })
       });
-    } catch (e) { /* ignore individual delete errors */ }
+    } catch (e) { /* ignore */ }
   }
 }
 
@@ -159,10 +166,12 @@ async function sendMsg(chatId, text, options = {}) {
     const data = await res.json();
     if (data.ok && data.result && data.result.message_id) {
       trackMsg(chatId, data.result.message_id);
+      return data.result.message_id;
     }
   } catch (err) {
     console.error(`Failed to send message to ${chatId}:`, err.message);
   }
+  return null;
 }
 
 // ─────────────────────────────────────────────
@@ -170,16 +179,17 @@ async function sendMsg(chatId, text, options = {}) {
 // ─────────────────────────────────────────────
 async function handleBotMessage(message) {
   const chatId = String(message.chat.id);
-  if (message.message_id) {
-    trackMsg(chatId, message.message_id);
+  const msgId = message.message_id;
+  if (msgId) {
+    trackMsg(chatId, msgId);
   }
   const text = message.text.trim();
   const lower = text.toLowerCase();
 
   // ── Clear / Clean command ──
   if (lower === 'clear' || lower === '/clear' || lower === 'clean' || lower === '/clean') {
-    await clearChat(chatId);
-    await sendMsg(chatId, `🧹 <b>Chat history wiped clean!</b>\nAll previous sensitive messages deleted for privacy.`);
+    await clearChat(chatId, msgId);
+    await sendMsg(chatId, `✨ <b>Chat wiped completely!</b>\nYour chat is now 100% clean & new.`);
     return;
   }
 
