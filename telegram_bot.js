@@ -116,14 +116,14 @@ function trackMsg(chatId, msgId) {
   chatHistory.get(chatId).add(msgId);
 }
 
-// Function to delete all conversation messages from both client and bot side (makes chat look brand new!)
+// Function to delete ALL conversation messages (old and new) from both client and bot side
 async function clearChat(chatId, latestMsgId = null) {
   const set = chatHistory.get(chatId) || new Set();
   chatHistory.delete(chatId);
 
-  // Deep sweep: include range of recent message IDs to ensure 100% clean chat
+  // Deep sweep: include up to 300 previous message IDs to wipe all old messages
   if (latestMsgId) {
-    const start = Math.max(1, Number(latestMsgId) - 60);
+    const start = Math.max(1, Number(latestMsgId) - 300);
     for (let id = start; id <= Number(latestMsgId); id++) {
       set.add(id);
     }
@@ -132,24 +132,17 @@ async function clearChat(chatId, latestMsgId = null) {
   const msgIds = Array.from(set);
   if (msgIds.length === 0) return;
 
-  // Try bulk delete (Telegram API 7.0+)
-  try {
-    await fetch(`https://api.telegram.org/bot${botToken}/deleteMessages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, message_ids: msgIds })
-    });
-  } catch (e) { /* fallback */ }
-
-  // Fallback single delete
-  for (const id of msgIds) {
+  // Split into chunks of 100 (Telegram deleteMessages API supports max 100 IDs per call)
+  const chunkSize = 100;
+  for (let i = 0; i < msgIds.length; i += chunkSize) {
+    const chunk = msgIds.slice(i, i + chunkSize);
     try {
-      await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
+      await fetch(`https://api.telegram.org/bot${botToken}/deleteMessages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, message_id: id })
+        body: JSON.stringify({ chat_id: chatId, message_ids: chunk })
       });
-    } catch (e) { /* ignore */ }
+    } catch (e) { /* ignore chunk delete error */ }
   }
 }
 
