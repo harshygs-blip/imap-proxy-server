@@ -179,10 +179,9 @@ async function handleBotMessage(message) {
   const text = message.text.trim();
   const lower = text.toLowerCase();
 
-  // ── Clear / Clean command ──
+  // ── Clear / Clean command (Silent wipe: zero response message) ──
   if (lower === 'clear' || lower === '/clear' || lower === 'clean' || lower === '/clean') {
     await clearChat(chatId, msgId);
-    await sendMsg(chatId, `✨ <b>Chat wiped completely!</b>\nYour chat is now 100% clean & new.`);
     return;
   }
 
