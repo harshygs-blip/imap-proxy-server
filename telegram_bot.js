@@ -107,16 +107,59 @@ export async function initTelegramBot(db, app, admin) {
   }
 }
 
+// In-memory chat message history: chatId -> Set of message_ids for auto-cleaning
+const chatHistory = new Map();
+
+function trackMsg(chatId, msgId) {
+  if (!msgId) return;
+  if (!chatHistory.has(chatId)) chatHistory.set(chatId, new Set());
+  chatHistory.get(chatId).add(msgId);
+}
+
+// Function to delete all conversation messages from both client and bot side
+async function clearChat(chatId) {
+  const set = chatHistory.get(chatId);
+  if (!set || set.size === 0) return;
+  const msgIds = Array.from(set);
+  chatHistory.delete(chatId);
+
+  // Try bulk delete first (Telegram API 7.0+)
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/deleteMessages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_ids: msgIds })
+    });
+    const data = await res.json();
+    if (data.ok) return;
+  } catch (e) { /* fallback to single delete */ }
+
+  // Fallback: delete messages one by one
+  for (const id of msgIds) {
+    try {
+      await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: id })
+      });
+    } catch (e) { /* ignore individual delete errors */ }
+  }
+}
+
 // ─────────────────────────────────────────────
 // SEND MESSAGE
 // ─────────────────────────────────────────────
-async function sendMsg(chatId, text) {
+async function sendMsg(chatId, text, options = {}) {
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...options })
     });
+    const data = await res.json();
+    if (data.ok && data.result && data.result.message_id) {
+      trackMsg(chatId, data.result.message_id);
+    }
   } catch (err) {
     console.error(`Failed to send message to ${chatId}:`, err.message);
   }
@@ -127,8 +170,18 @@ async function sendMsg(chatId, text) {
 // ─────────────────────────────────────────────
 async function handleBotMessage(message) {
   const chatId = String(message.chat.id);
+  if (message.message_id) {
+    trackMsg(chatId, message.message_id);
+  }
   const text = message.text.trim();
   const lower = text.toLowerCase();
+
+  // ── Clear / Clean command ──
+  if (lower === 'clear' || lower === '/clear' || lower === 'clean' || lower === '/clean') {
+    await clearChat(chatId);
+    await sendMsg(chatId, `🧹 <b>Chat history wiped clean!</b>\nAll previous sensitive messages deleted for privacy.`);
+    return;
+  }
 
   // ── If user is mid-signup, handle conversation steps first ──
   if (pendingSignups.has(chatId)) {
@@ -610,7 +663,8 @@ async function handleOtp(chatId) {
       `🔑 <b>Your Garena OTP:</b>\n\n` +
       `<code>${otp}</code>\n\n` +
       `👆 Tap to copy.\n` +
-      `<i>⚡ Mailbox automatically unlinked from console after 1-time OTP scan.</i>`);
+      `<i>⚡ Mailbox unlinked from console after 1-time OTP scan.</i>\n` +
+      `<i>💡 Type <code>clear</code> to wipe chat history anytime.</i>`);
 
   } catch (err) {
     await sendMsg(chatId, `❌ <b>Mailbox connection error!</b>\n\n<i>${err.message}</i>\n\nCheck if App Password is correct in Email Monitor.`);
