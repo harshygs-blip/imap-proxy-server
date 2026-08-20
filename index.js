@@ -11,12 +11,26 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Global exception safety so node process never crashes on Render
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err.stack || err.message);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
 // Initialize Firebase Admin
 const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
 
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    let serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (typeof serviceAccount === 'string') {
+      serviceAccount = JSON.parse(serviceAccount);
+    }
+    if (serviceAccount.private_key) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
@@ -27,6 +41,9 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 } else if (fs.existsSync(serviceAccountPath)) {
   try {
     const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+    if (serviceAccount.private_key) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
@@ -303,6 +320,137 @@ app.post('/api/license/generate', async (req, res) => {
     return res.status(500).json({ error: err.message || 'Internal server error during key generation.' });
   }
 });
+
+
+// ============================================================
+// Zoho Auth Code Exchange Endpoint (Merged from Zoho Proxy)
+// ============================================================
+app.post('/zoho/token', async (req, res) => {
+  const { code, redirect_uri } = req.body;
+  const clientId = process.env.ZOHO_CLIENT_ID || process.env.VITE_ZOHO_CLIENT_ID;
+  const clientSecret = process.env.ZOHO_CLIENT_SECRET || process.env.VITE_ZOHO_CLIENT_SECRET;
+
+  if (!code || !redirect_uri) {
+    return res.status(400).json({ error: 'Missing code or redirect_uri parameters.' });
+  }
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ error: 'Zoho API credentials are not configured on the proxy server.' });
+  }
+
+  try {
+    const tokenUrl = 'https://accounts.zoho.in/oauth/v2/token';
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri,
+        grant_type: 'authorization_code'
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json(data);
+    }
+
+    res.status(200).json(data);
+  } catch (error) {
+    console.error('Error exchanging token:', error);
+    res.status(500).json({ error: 'Internal server error during token exchange.' });
+  }
+});
+
+// ============================================================
+// Zoho Access Token Refresh Endpoint (Merged from Zoho Proxy)
+// ============================================================
+app.post('/zoho/refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+  const clientId = process.env.ZOHO_CLIENT_ID || process.env.VITE_ZOHO_CLIENT_ID;
+  const clientSecret = process.env.ZOHO_CLIENT_SECRET || process.env.VITE_ZOHO_CLIENT_SECRET;
+
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'Missing refresh_token parameter.' });
+  }
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ error: 'Zoho API credentials are not configured on the proxy server.' });
+  }
+
+  try {
+    const tokenUrl = 'https://accounts.zoho.in/oauth/v2/token';
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token,
+        grant_type: 'refresh_token'
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json(data);
+    }
+
+    res.status(200).json(data);
+  } catch (error) {
+    console.error('Error refreshing token:', error);
+    res.status(500).json({ error: 'Internal server error during token refresh.' });
+  }
+});
+
+// ============================================================
+// General Zoho Mail API Proxy Endpoint (Merged from Zoho Proxy)
+// ============================================================
+app.post('/zoho/proxy', async (req, res) => {
+  const { path: zPath, method, token, body } = req.body;
+
+  if (!zPath || !method || !token) {
+    return res.status(400).json({ error: 'Missing path, method, or token parameter.' });
+  }
+
+  try {
+    const targetUrl = `https://mail.zoho.in${zPath}`;
+    const options = {
+      method: method.toUpperCase(),
+      headers: {
+        'Authorization': `Zoho-oauthtoken ${token}`,
+        'Content-Type': 'application/json'
+      }
+    };
+
+    if (body && ['POST', 'PUT', 'PATCH'].includes(options.method)) {
+      options.body = JSON.stringify(body);
+    }
+
+    const response = await fetch(targetUrl, options);
+    
+    // Check if response has content to parse
+    const contentType = response.headers.get('content-type');
+    let data = {};
+    
+    if (contentType && contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      const text = await response.text();
+      data = { text };
+    }
+
+    if (!response.ok) {
+      return res.status(response.status).json(data);
+    }
+
+    res.status(200).json(data);
+  } catch (error) {
+    console.error('Proxy request failure:', error);
+    res.status(500).json({ error: 'Internal server error routing proxy request.' });
+  }
+});
+
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
