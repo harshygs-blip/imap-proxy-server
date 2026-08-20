@@ -80,12 +80,18 @@ app.post('/imap/test', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields: host, user, pass' });
   }
 
+  const cleanUser = String(user).trim();
+  const cleanPass = String(pass).replace(/\s+/g, '');
+
   const client = new ImapFlow({
     host,
     port: parseInt(port) || 993,
     secure: secure !== false,
-    auth: { user, pass },
+    auth: { user: cleanUser, pass: cleanPass },
     logger: false
+  });
+  client.on('error', err => {
+    console.error('ImapFlow Client (test) Error:', err.message);
   });
 
   try {
@@ -112,11 +118,14 @@ app.post('/imap/fetch', async (req, res) => {
   const limitVal = Math.min(parseInt(limit) || 15, 50);
   const foldersToQuery = (folders && folders.length > 0) ? folders : ['INBOX'];
 
+  const cleanUser = String(user).trim();
+  const cleanPass = String(pass).replace(/\s+/g, '');
+
   const client = new ImapFlow({
     host,
     port: parseInt(port) || 993,
     secure: secure !== false,
-    auth: { user, pass },
+    auth: { user: cleanUser, pass: cleanPass },
     logger: false
   });
 
@@ -453,8 +462,8 @@ app.post('/zoho/proxy', async (req, res) => {
 
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`✅ IMAP Proxy Server running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ IMAP Proxy Server running on 0.0.0.0:${PORT}`);
   // Always start the bot - it handles missing db gracefully
   initTelegramBot(db, app, admin).catch(err => {
     console.error("Failed to start Telegram Bot:", err);
