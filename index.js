@@ -63,7 +63,12 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 const db = admin.apps.length > 0 ? admin.firestore() : null;
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // Health check
@@ -462,10 +467,14 @@ app.post('/zoho/proxy', async (req, res) => {
 
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ IMAP Proxy Server running on 0.0.0.0:${PORT}`);
-  // Always start the bot - it handles missing db gracefully
-  initTelegramBot(db, app, admin).catch(err => {
-    console.error("Failed to start Telegram Bot:", err);
+if (process.env.NODE_ENV !== 'test' && !process.env.VERCEL) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ IMAP Proxy Server running on 0.0.0.0:${PORT}`);
+    // Always start the bot - it handles missing db gracefully
+    initTelegramBot(db, app, admin).catch(err => {
+      console.error("Failed to start Telegram Bot:", err);
+    });
   });
-});
+}
+
+export default app;
