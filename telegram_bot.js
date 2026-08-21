@@ -82,8 +82,12 @@ export async function initTelegramBot(db, app, admin) {
     res.sendStatus(200);
     try {
       const update = req.body;
-      if (update && update.message && update.message.text) {
-        await handleBotMessage(update.message);
+      if (update) {
+        if (update.message && update.message.text) {
+          await handleBotMessage(update.message);
+        } else if (update.callback_query) {
+          await handleCallbackQuery(update.callback_query);
+        }
       }
     } catch (err) {
       console.error('Telegram webhook error:', err.message);
@@ -109,11 +113,63 @@ export async function initTelegramBot(db, app, admin) {
 
 // In-memory chat message history: chatId -> Set of message_ids for auto-cleaning
 const chatHistory = new Map();
+const agreedTerms = new Set();
 
 function trackMsg(chatId, msgId) {
   if (!msgId) return;
   if (!chatHistory.has(chatId)) chatHistory.set(chatId, new Set());
   chatHistory.get(chatId).add(msgId);
+}
+
+// Answer Callback Query (inline button click acknowledgment)
+async function answerCallbackQuery(callbackQueryId, text = '') {
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text })
+    });
+  } catch (err) {
+    console.error('Failed to answer callback query:', err.message);
+  }
+}
+
+// Edit Message Text
+async function editMsgText(chatId, messageId, text, options = {}) {
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...options })
+    });
+  } catch (err) {
+    console.error(`Failed to edit message ${messageId}:`, err.message);
+  }
+}
+
+// Handle Callback Queries (Button Clicks)
+async function handleCallbackQuery(callbackQuery) {
+  const chatId = String(callbackQuery.message.chat.id);
+  const messageId = callbackQuery.message.message_id;
+  const data = callbackQuery.data;
+
+  if (data === 'agree_terms') {
+    await answerCallbackQuery(callbackQuery.id, '✅ Thank you for agreeing!');
+    agreedTerms.add(chatId);
+
+    // Edit message to show agreement confirmed & instructions
+    await editMsgText(chatId, messageId,
+      `✅ <b>Terms &amp; Conditions Agreed!</b>\n\n` +
+      `👋 <b>Welcome to Garena OTP Assistant!</b>\n\n` +
+      `<b>How to use:</b>\n` +
+      `1️⃣ Type <code>signup YOUR_LICENSE_KEY</code>\n` +
+      `   Example: <code>signup TG-GPFPS010</code>\n\n` +
+      `2️⃣ Enter your email &amp; set a password\n\n` +
+      `3️⃣ Copy the assigned Garena email\n\n` +
+      `4️⃣ After OTP arrives, type <code>otp</code>\n\n` +
+      `⚠️ <i>Limit: 1 OTP per 48 hours</i>`
+    );
+  }
 }
 
 // Function to delete ALL conversation messages (old and new) from both client and bot side
@@ -142,7 +198,9 @@ async function clearChat(chatId, latestMsgId = null) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, message_ids: chunk })
       });
-    } catch (e) { /* ignore chunk delete error */ }
+    } catch (err) {
+      console.error(`Failed to delete messages chunk for ${chatId}:`, err.message);
+    }
   }
 }
 
@@ -194,14 +252,20 @@ async function handleBotMessage(message) {
   // ── /start ──
   if (lower === '/start' || lower === 'hi' || lower === 'hello') {
     await sendMsg(chatId,
-      `👋 <b>Welcome to Garena OTP Assistant!</b>\n\n` +
-      `<b>How to use:</b>\n` +
-      `1️⃣ Type <code>signup YOUR_LICENSE_KEY</code>\n` +
-      `   Example: <code>signup TG-9QH7MYR5</code>\n\n` +
-      `2️⃣ Enter your email &amp; set a password\n\n` +
-      `3️⃣ Copy the assigned Garena email\n\n` +
-      `4️⃣ After OTP arrives, type <code>otp</code>\n\n` +
-      `⚠️ <i>Limit: 1 OTP per 48 hours</i>`);
+      `📋 <b>Terms &amp; Conditions Agreement</b>\n\n` +
+      `Are you agree with the terms and condition\n` +
+      `https://ff-store-4a61e.web.app/refund-policy\n` +
+      `https://ff-store-4a61e.web.app/privacy-policy`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ I Agree', callback_data: 'agree_terms' }
+            ]
+          ]
+        }
+      }
+    );
     return;
   }
 
