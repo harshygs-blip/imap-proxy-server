@@ -93,14 +93,22 @@ app.post('/imap/test', async (req, res) => {
     port: parseInt(port) || 993,
     secure: secure !== false,
     auth: { user: cleanUser, pass: cleanPass },
-    logger: false
+    logger: false,
+    connectionTimeout: 5000,
+    greetingTimeout: 5000,
+    socketTimeout: 6000
   });
   client.on('error', err => {
     console.error('ImapFlow Client (test) Error:', err.message);
   });
 
   try {
-    await client.connect();
+    const connectPromise = client.connect();
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('IMAP connection timed out (invalid or revoked App Password).')), 8000)
+    );
+    await Promise.race([connectPromise, timeoutPromise]);
+
     const mailboxes = await client.list();
     const folderNames = mailboxes.map(f => f.name);
     await client.logout();
@@ -131,11 +139,18 @@ app.post('/imap/fetch', async (req, res) => {
     port: parseInt(port) || 993,
     secure: secure !== false,
     auth: { user: cleanUser, pass: cleanPass },
-    logger: false
+    logger: false,
+    connectionTimeout: 5000,
+    greetingTimeout: 5000,
+    socketTimeout: 6000
   });
 
   try {
-    await client.connect();
+    const connectPromise = client.connect();
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('IMAP connection timed out (invalid or revoked App Password).')), 8000)
+    );
+    await Promise.race([connectPromise, timeoutPromise]);
     const allMessages = [];
 
     for (const folder of foldersToQuery) {
