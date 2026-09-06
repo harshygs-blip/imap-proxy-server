@@ -91,7 +91,7 @@ app.use(express.json());
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'imap-proxy-server', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'imap-proxy-server', version: '2.1.2', timestamp: new Date().toISOString() });
 });
 
 // ============================================================
@@ -633,6 +633,7 @@ const handleGarenaOtpRequest = async (req, res) => {
     // --- Branch A: Gmail OAuth accounts (stored in gmail_credentials with gmail_refresh_token) ---
     if (foundDoc._type === 'gmail' && foundDoc.gmail_refresh_token) {
       console.log(`[API /api/otp/garena] Fetching OTP for ${foundDoc.email} via Google Gmail API...`);
+      try {
         let clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
         let clientSecret = process.env.GOOGLE_CLIENT_SECRET || process.env.VITE_GOOGLE_CLIENT_SECRET;
 
