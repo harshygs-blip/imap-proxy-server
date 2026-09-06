@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import admin from 'firebase-admin';
@@ -81,17 +82,74 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 const db = admin.apps.length > 0 ? admin.firestore() : null;
 
 const app = express();
+app.disable('x-powered-by');
+
+// Trust proxy on Render (needed for accurate client IP rate limiting behind reverse proxy)
+app.set('trust proxy', 1);
+
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-api-key']
 }));
 app.options('*', cors());
 app.use(express.json());
 
-// Health check
+// ------------------------------------------------------------
+// Production Security 1: IP Rate Limiting (15 req/min per IP)
+// ------------------------------------------------------------
+const otpRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 15, // max 15 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  statusCode: 429,
+  message: {
+    success: false,
+    error: 'Too Many Requests',
+    message: 'Rate limit exceeded: Maximum 15 requests per minute per IP address. Please try again later.'
+  }
+});
+
+// ------------------------------------------------------------
+// Production Security 2: API Key Authentication Middleware
+// ------------------------------------------------------------
+const API_SECRET_KEY = process.env.API_SECRET_KEY || 'garena_sec_9988_a7f92b4c81d3';
+
+const verifyApiKey = (req, res, next) => {
+  let key = req.headers['x-api-key'] || '';
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    key = authHeader.substring(7).trim();
+  } else if (!key && authHeader) {
+    key = authHeader.trim();
+  }
+  if (!key && req.query && req.query.key) {
+    key = String(req.query.key).trim();
+  }
+  if (!key && req.body && req.body.key) {
+    key = String(req.body.key).trim();
+  }
+
+  if (!key || key !== API_SECRET_KEY) {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized: Invalid or missing API key'
+    });
+  }
+
+  next();
+};
+
+// ------------------------------------------------------------
+// Production Security 3: Lock Root & Sensitive Probe Routes (Anti-Reconnaissance)
+// ------------------------------------------------------------
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'imap-proxy-server', version: '2.1.2', timestamp: new Date().toISOString() });
+  res.status(404).send('Not Found');
+});
+
+app.all(['/accounts', '/list', '/debug', '/api/accounts', '/users', '/credentials'], (req, res) => {
+  res.status(404).send('Not Found');
 });
 
 // ============================================================
@@ -812,7 +870,7 @@ const handleGarenaOtpRequest = async (req, res) => {
       }
     }
 
-    // 4. Return Final Result
+    // 4. Return Final Result (Isolated OTP only - Zero raw body / private data exposure)
     if (candidateOtp) {
       return res.status(200).json({
         success: true,
@@ -822,10 +880,7 @@ const handleGarenaOtpRequest = async (req, res) => {
         code: candidateOtp,
         digits: 8,
         service: 'Garena Free Fire',
-        subject: matchedEmailInfo?.subject || 'Garena Verification Code',
-        sender: matchedEmailInfo?.sender || 'Garena',
-        receivedAt: matchedEmailInfo?.date ? new Date(matchedEmailInfo.date).toISOString() : new Date().toISOString(),
-        message: 'Latest Garena Free Fire 8-digit OTP retrieved successfully'
+        receivedAt: matchedEmailInfo?.date ? new Date(matchedEmailInfo.date).toISOString() : new Date().toISOString()
       });
     }
 
@@ -847,12 +902,20 @@ const handleGarenaOtpRequest = async (req, res) => {
   }
 };
 
-app.get('/api/otp/garena', handleGarenaOtpRequest);
-app.post('/api/otp/garena', handleGarenaOtpRequest);
+// ------------------------------------------------------------
+// Protected OTP Endpoints with Rate Limiting & Secret API Key
+// ------------------------------------------------------------
+app.get('/api/otp/garena', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
+app.post('/api/otp/garena', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
 
 // Aliases for convenience
-app.get('/api/garena/otp', handleGarenaOtpRequest);
-app.post('/api/garena/otp', handleGarenaOtpRequest);
+app.get('/api/garena/otp', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
+app.post('/api/garena/otp', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
+
+// Catch-all 404 for any unknown route (Scanners / Crawlers receive generic 404)
+app.use((req, res) => {
+  res.status(404).send('Not Found');
+});
 
 if (process.env.NODE_ENV !== 'test' && !process.env.VERCEL) {
   app.listen(PORT, '0.0.0.0', () => {
