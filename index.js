@@ -19,6 +19,24 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection:', reason);
 });
 
+// Auto-load environment variables from .env if present
+const parentEnvPath = path.join(__dirname, '..', '.env');
+const localEnvPath = path.join(__dirname, '.env');
+[parentEnvPath, localEnvPath].forEach(envFile => {
+  if (fs.existsSync(envFile)) {
+    const lines = fs.readFileSync(envFile, 'utf8').split('\n');
+    lines.forEach(line => {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+        const [k, ...v] = trimmed.split('=');
+        const key = k.trim();
+        const val = v.join('=').trim();
+        if (!process.env[key]) process.env[key] = val;
+      }
+    });
+  }
+});
+
 // Initialize Firebase Admin
 const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
 
@@ -480,8 +498,349 @@ app.post('/zoho/proxy', async (req, res) => {
   }
 });
 
-
 const PORT = process.env.PORT || 8080;
+
+// ============================================================
+// 4. GET & POST /api/otp/garena — Fetch Latest Garena Free Fire 8-Digit OTP
+// ============================================================
+const handleGarenaOtpRequest = async (req, res) => {
+  const targetRaw = req.query.email || req.body.email || req.query.user || req.body.user || req.query.id || req.body.id || '';
+  const isMock = req.query.mock === 'true' || req.body.mock === true;
+
+  if (!targetRaw || !targetRaw.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required parameter: email',
+      message: 'Please provide the email address to check.'
+    });
+  }
+
+  const targetEmail = String(targetRaw).trim().toLowerCase();
+
+  try {
+    if (!db) {
+      return res.status(500).json({ error: 'Database service is not initialized on proxy server.' });
+    }
+
+    // 1. Search across monitored accounts in Firestore (imap_credentials, gmail_credentials, zoho_credentials)
+    let foundDoc = null;
+
+    // Check imap_credentials
+    const imapSnap = await db.collection('imap_credentials').get();
+    for (const doc of imapSnap.docs) {
+      const data = doc.data();
+      const em = (data.imap_email || data.imap_user || data.email || '').toLowerCase().trim();
+      const uid = (data.game_uid || data.ff_uid || '').toString().trim();
+      if (em === targetEmail || (em && targetEmail && (em === targetEmail || em.split('@')[0] === targetEmail.split('@')[0])) || (uid && uid === targetEmail)) {
+        foundDoc = {
+          ...data,
+          id: doc.id,
+          _type: 'imap',
+          email: data.imap_email || data.imap_user || data.email,
+          user: data.imap_user || data.imap_email || data.email,
+          password: data.imap_password,
+          host: data.imap_host || 'imap.gmail.com',
+          port: data.imap_port || 993,
+          secure: data.imap_secure !== false
+        };
+        break;
+      }
+    }
+
+    // Check gmail_credentials if not found yet
+    if (!foundDoc) {
+      const gmailSnap = await db.collection('gmail_credentials').get();
+      for (const doc of gmailSnap.docs) {
+        const data = doc.data();
+        const em = (data.gmail_email || data.email || '').toLowerCase().trim();
+        const uid = (data.game_uid || data.ff_uid || '').toString().trim();
+        if (em === targetEmail || (em && targetEmail && (em === targetEmail || em.split('@')[0] === targetEmail.split('@')[0])) || (uid && uid === targetEmail)) {
+          foundDoc = {
+            ...data,
+            id: doc.id,
+            _type: 'gmail',
+            email: data.gmail_email || data.email,
+            user: data.gmail_email || data.email,
+            password: data.gmail_refresh_token,
+            host: 'imap.gmail.com',
+            port: 993,
+            secure: true
+          };
+          break;
+        }
+      }
+    }
+
+    // Check zoho_credentials if not found yet
+    if (!foundDoc) {
+      const zohoSnap = await db.collection('zoho_credentials').get();
+      for (const doc of zohoSnap.docs) {
+        const data = doc.data();
+        const em = (data.zoho_email || data.email || '').toLowerCase().trim();
+        const uid = (data.game_uid || data.ff_uid || '').toString().trim();
+        if (em === targetEmail || (em && targetEmail && (em === targetEmail || em.split('@')[0] === targetEmail.split('@')[0])) || (uid && uid === targetEmail)) {
+          foundDoc = {
+            ...data,
+            id: doc.id,
+            _type: 'zoho',
+            email: data.zoho_email || data.email,
+            user: data.zoho_email || data.email,
+            password: data.zoho_refresh_token,
+            host: 'imap.zoho.in',
+            port: 993,
+            secure: true
+          };
+          break;
+        }
+      }
+    }
+
+    // 2. If email does NOT match any monitored account -> Return 403 with exact required message
+    if (!foundDoc) {
+      console.log(`[API /api/otp/garena] Unmatched email: "${targetEmail}" -> Returning "buy from here then try to bind"`);
+      return res.status(403).json({
+        success: false,
+        error: 'buy from here then try to bind',
+        message: 'buy from here then try to bind',
+        status: 'UNMATCHED_EMAIL'
+      });
+    }
+
+    console.log(`[API /api/otp/garena] Matched email in monitor: ${foundDoc.email} (${foundDoc.id})`);
+
+    // Mock testing mode for quick localhost verification without waiting for external mail network
+    if (isMock) {
+      return res.status(200).json({
+        success: true,
+        matched: true,
+        email: foundDoc.email,
+        otp: '83920194',
+        code: '83920194',
+        digits: 8,
+        service: 'Garena Free Fire',
+        subject: '[Garena] Your Verification Code is 83920194',
+        sender: 'account@garena.com',
+        receivedAt: new Date().toISOString(),
+        isMock: true,
+        message: 'Garena Free Fire 8-digit OTP retrieved successfully (mock)'
+      });
+    }
+
+    // 3. Extract OTP via Gmail API or IMAP
+    let candidateOtp = null;
+    let matchedEmailInfo = null;
+
+    // --- Branch A: Gmail OAuth accounts (stored in gmail_credentials with gmail_refresh_token) ---
+    if (foundDoc._type === 'gmail' && foundDoc.gmail_refresh_token) {
+      console.log(`[API /api/otp/garena] Fetching OTP for ${foundDoc.email} via Google Gmail API...`);
+      try {
+        const clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
+        const clientSecret = process.env.GOOGLE_CLIENT_SECRET || process.env.VITE_GOOGLE_CLIENT_SECRET;
+
+        if (!clientId || !clientSecret) {
+          console.error('[API /api/otp/garena] Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment variables.');
+        }
+
+        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: clientId,
+            client_secret: clientSecret,
+            refresh_token: foundDoc.gmail_refresh_token,
+            grant_type: 'refresh_token'
+          })
+        });
+
+        if (!tokenRes.ok) {
+          const errText = await tokenRes.text();
+          console.error('[API /api/otp/garena] Failed to refresh Google access token:', errText);
+        } else {
+          const tokenData = await tokenRes.json();
+          const accessToken = tokenData.access_token;
+
+          if (accessToken) {
+            const listRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10', {
+              headers: { Authorization: `Bearer ${accessToken}` }
+            });
+
+            if (listRes.ok) {
+              const listData = await listRes.json();
+              const messages = listData.messages || [];
+
+              for (const msgItem of messages) {
+                try {
+                  const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgItem.id}?format=full`, {
+                    headers: { Authorization: `Bearer ${accessToken}` }
+                  });
+                  if (!detailRes.ok) continue;
+
+                  const detail = await detailRes.json();
+                  const headers = detail.payload?.headers || [];
+                  const fromVal = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+                  const subjectVal = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
+                  const snippetVal = detail.snippet || '';
+
+                  // Look for 8-digit OTP in snippet, subject, or raw payload
+                  const searchPool = `${subjectVal}\n${snippetVal}\n${JSON.stringify(detail.payload || {})}`;
+                  const match8 = searchPool.match(/(?:code|otp|is|verification code|below)[:\s]*([0-9]{8})\b/i) ||
+                                 searchPool.match(/\b([0-9]{8})\b/);
+
+                  if (match8 && match8[1]) {
+                    candidateOtp = match8[1];
+                    matchedEmailInfo = {
+                      code: candidateOtp,
+                      subject: subjectVal,
+                      sender: fromVal,
+                      date: new Date(parseInt(detail.internalDate) || Date.now())
+                    };
+                    break;
+                  }
+                } catch (msgErr) {
+                  console.warn('[API /api/otp/garena] Error reading Gmail message item:', msgErr.message);
+                }
+              }
+            }
+          }
+        }
+      } catch (gmailErr) {
+        console.error('[API /api/otp/garena] Gmail API Error:', gmailErr.message);
+      }
+    }
+
+    // --- Branch B: IMAP accounts (stored in imap_credentials with App Password) ---
+    if (!candidateOtp && foundDoc.password && !foundDoc.password.startsWith('1//')) {
+      const cleanUser = String(foundDoc.user || foundDoc.email).trim();
+      const cleanPass = String(foundDoc.password || '').replace(/\s+/g, '');
+
+      console.log(`[API /api/otp/garena] Fetching OTP for ${foundDoc.email} via IMAP (${foundDoc.host})...`);
+      let client = null;
+      try {
+        client = new ImapFlow({
+          host: foundDoc.host,
+          port: parseInt(foundDoc.port) || 993,
+          secure: foundDoc.secure !== false,
+          auth: { user: cleanUser, pass: cleanPass },
+          logger: false,
+          connectionTimeout: 6000,
+          greetingTimeout: 6000,
+          socketTimeout: 7000
+        });
+
+        client.on('error', (err) => {
+          // Suppress unhandled errors
+        });
+
+        const connectPromise = client.connect();
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('IMAP connection timed out')), 7000)
+        );
+        await Promise.race([connectPromise, timeoutPromise]);
+
+        const foldersToScan = ['INBOX', 'Spam', 'Newsletter'];
+
+        for (const folder of foldersToScan) {
+          try {
+            const lock = await client.getMailboxLock(folder);
+            try {
+              const status = client.mailbox;
+              const total = status.exists || 0;
+              if (total === 0) continue;
+
+              const startSeq = Math.max(1, total - 12);
+              const range = `${startSeq}:*`;
+
+              for await (const msg of client.fetch(range, { envelope: true, source: true })) {
+                try {
+                  const parsed = await simpleParser(msg.source);
+                  const fromAddr = parsed.from?.text || (msg.envelope?.from?.[0] ? `${msg.envelope.from[0].name || ''} <${msg.envelope.from[0].address || ''}>`.trim() : '');
+                  const subject = parsed.subject || msg.envelope?.subject || '';
+                  const bodyText = parsed.text || '';
+                  const bodyHtml = parsed.html || '';
+                  const fullContent = `${subject}\n${bodyText}\n${bodyHtml}`;
+
+                  const match8 = fullContent.match(/(?:code|otp|is|verification code|verification)[:\s]*([0-9]{8})\b/i) ||
+                                 fullContent.match(/\b([0-9]{8})\b/);
+
+                  if (match8 && match8[1]) {
+                    const detectedCode = match8[1];
+                    const msgDate = parsed.date || msg.envelope?.date || new Date();
+
+                    if (!candidateOtp || (matchedEmailInfo && msgDate > matchedEmailInfo.date)) {
+                      candidateOtp = detectedCode;
+                      matchedEmailInfo = {
+                        code: detectedCode,
+                        subject: subject,
+                        sender: fromAddr,
+                        date: msgDate
+                      };
+                    }
+                  }
+                } catch (parseErr) {
+                  // Ignore
+                }
+              }
+            } finally {
+              lock.release();
+            }
+          } catch (folderErr) {
+            // Folder scan error
+          }
+
+          if (candidateOtp) break;
+        }
+
+        await client.logout().catch(() => {});
+      } catch (imapErr) {
+        console.warn('[API /api/otp/garena] IMAP attempt error:', imapErr.message);
+        if (client) {
+          try { await client.close().catch(() => {}); } catch (_) {}
+        }
+      }
+    }
+
+    // 4. Return Final Result
+    if (candidateOtp) {
+      return res.status(200).json({
+        success: true,
+        matched: true,
+        email: foundDoc.email,
+        otp: candidateOtp,
+        code: candidateOtp,
+        digits: 8,
+        service: 'Garena Free Fire',
+        subject: matchedEmailInfo?.subject || 'Garena Verification Code',
+        sender: matchedEmailInfo?.sender || 'Garena',
+        receivedAt: matchedEmailInfo?.date ? new Date(matchedEmailInfo.date).toISOString() : new Date().toISOString(),
+        message: 'Latest Garena Free Fire 8-digit OTP retrieved successfully'
+      });
+    }
+
+    return res.status(200).json({
+      success: false,
+      matched: true,
+      email: foundDoc.email,
+      error: 'OTP_NOT_FOUND',
+      message: 'Email matched in Email Monitor, but no 8-digit Garena OTP found in recent emails. Please request OTP and try again.'
+    });
+
+  } catch (err) {
+    console.error('[API /api/otp/garena] Internal error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'INTERNAL_SERVER_ERROR',
+      message: err.message
+    });
+  }
+};
+
+app.get('/api/otp/garena', handleGarenaOtpRequest);
+app.post('/api/otp/garena', handleGarenaOtpRequest);
+
+// Aliases for convenience
+app.get('/api/garena/otp', handleGarenaOtpRequest);
+app.post('/api/garena/otp', handleGarenaOtpRequest);
+
 if (process.env.NODE_ENV !== 'test' && !process.env.VERCEL) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ IMAP Proxy Server running on 0.0.0.0:${PORT}`);

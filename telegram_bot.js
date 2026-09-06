@@ -2,7 +2,7 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 
 // Bot token: env var > hardcoded fallback
-const HARDCODED_BOT_TOKEN = '8700234031:AAEBQCGb3zXS7Jb1xlHT7novzQEm-tamhGk';
+const HARDCODED_BOT_TOKEN = '8700234031:AAFmFxuHnvQXREQ91C95ImK2bbZzlMY-1wI';
 let botToken = process.env.TELEGRAM_BOT_TOKEN || HARDCODED_BOT_TOKEN;
 
 // In-memory conversation state for multi-step signup
@@ -77,7 +77,7 @@ export async function initTelegramBot(db, app, admin) {
     return;
   }
 
-  // Register webhook endpoint
+  // Register webhook endpoint (for production webhook deployments)
   app.post('/telegram/webhook', async (req, res) => {
     res.sendStatus(200);
     try {
@@ -94,20 +94,65 @@ export async function initTelegramBot(db, app, admin) {
     }
   });
 
-  // Register webhook with Telegram
-  const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://imap-proxy-server.onrender.com';
-  const webhookUrl = `${RENDER_URL}/telegram/webhook`;
+  // If running on Render with process.env.RENDER_EXTERNAL_URL, register Webhook
+  // Otherwise, run direct Real-Time Long Polling (zero tunnels, zero latency, 100% instant responses!)
+  if (process.env.RENDER_EXTERNAL_URL) {
+    const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram/webhook`;
+    try {
+      const whRes = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: webhookUrl })
+      });
+      const whData = await whRes.json();
+      if (whData.ok) console.log(`✅ Telegram Webhook registered: ${webhookUrl}`);
+      else console.error('❌ Failed to register webhook:', whData.description);
+    } catch (err) {
+      console.error('❌ Error registering webhook:', err.message);
+    }
+  } else {
+    // Start Direct Real-Time Long Polling for Local Development & Instant Testing
+    startLongPolling();
+  }
+}
+
+// ─────────────────────────────────────────────
+// REAL-TIME LONG POLLING LOOP (Zero Tunnels / Instant Response)
+// ─────────────────────────────────────────────
+let pollingOffset = 0;
+let isPolling = false;
+
+async function startLongPolling() {
+  if (isPolling) return;
+  isPolling = true;
+
   try {
-    const whRes = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: webhookUrl })
-    });
-    const whData = await whRes.json();
-    if (whData.ok) console.log(`✅ Telegram Webhook registered: ${webhookUrl}`);
-    else console.error('❌ Failed to register webhook:', whData.description);
+    await fetch(`https://api.telegram.org/bot${botToken}/deleteWebhook`);
+    console.log("⚡ Telegram Webhook cleared — Direct Real-Time Long Polling active!");
   } catch (err) {
-    console.error('❌ Error registering webhook:', err.message);
+    console.warn("Could not delete webhook:", err.message);
+  }
+
+  while (isPolling) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/getUpdates?offset=${pollingOffset}&timeout=1`);
+      const data = await res.json();
+
+      if (data.ok && Array.isArray(data.result)) {
+        for (const update of data.result) {
+          pollingOffset = update.update_id + 1;
+          // Process updates concurrently so response is instant
+          if (update.message && update.message.text) {
+            handleBotMessage(update.message).catch(e => console.error("Msg error:", e.message));
+          } else if (update.callback_query) {
+            handleCallbackQuery(update.callback_query).catch(e => console.error("Cb error:", e.message));
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Polling loop error:", err.message);
+      await new Promise(r => setTimeout(r, 1000));
+    }
   }
 }
 
@@ -169,6 +214,13 @@ async function handleCallbackQuery(callbackQuery) {
       `4️⃣ After OTP arrives, type <code>otp</code>\n\n` +
       `⚠️ <i>Limit: 1 OTP per 48 hours</i>`
     );
+    return;
+  }
+
+  if (data.startsWith('store_price_')) {
+    await answerCallbackQuery(callbackQuery.id, '⚠️ Store is currently disabled.');
+    await sendMsg(chatId, `⚠️ <b>Store is currently disabled.</b>\n\nPlease contact admin directly: @alexccseller`);
+    return;
   }
 }
 
@@ -234,23 +286,32 @@ async function handleBotMessage(message) {
   if (msgId) {
     trackMsg(chatId, msgId);
   }
-  const text = message.text.trim();
-  const lower = text.toLowerCase();
+  const rawText = (message.text || '').trim();
+  if (!rawText) return;
 
-  // ── Clear / Clean command (Silent wipe: zero response message) ──
-  if (lower === 'clear' || lower === '/clear' || lower === 'clean' || lower === '/clean') {
+  // Strip Telegram bot username suffix (e.g. /store@id_providerbot -> /store)
+  const cleanText = rawText.split('@')[0].trim();
+  const lower = cleanText.toLowerCase();
+
+  // If user typed a slash command while mid-signup, clear pending signup state
+  if (lower.startsWith('/') && lower !== '/cancel' && pendingSignups.has(chatId)) {
+    pendingSignups.delete(chatId);
+  }
+
+  // ── Clear / Clean command ──
+  if (['clear', '/clear', 'clean', '/clean'].includes(lower)) {
     await clearChat(chatId, msgId);
     return;
   }
 
-  // ── If user is mid-signup, handle conversation steps first ──
+  // ── If user is mid-signup, handle conversation steps ──
   if (pendingSignups.has(chatId)) {
-    await handleSignupConversation(chatId, text);
+    await handleSignupConversation(chatId, rawText);
     return;
   }
 
-  // ── /start ──
-  if (lower === '/start' || lower === 'hi' || lower === 'hello') {
+  // ── /start / hi / hello / menu ──
+  if (['/start', 'start', 'hi', 'hello', 'hey', 'menu', '/menu'].includes(lower)) {
     await sendMsg(chatId,
       `📋 <b>Terms &amp; Conditions Agreement</b>\n\n` +
       `Are you agree with the terms and condition\n` +
@@ -269,8 +330,26 @@ async function handleBotMessage(message) {
     return;
   }
 
+  // ── Store / Catalog / Shop Commands (Disabled) ──
+  if (['store', '/store', 'catalog', '/catalog', 'shop', '/shop', 'buy', '/buy', 'ids', '/ids', 'id', '/id', 'price', '/price'].includes(lower)) {
+    await sendMsg(chatId,
+      `⚠️ <b>Account Store is currently disabled.</b>\n\n` +
+      `For any account inquiries or purchases, please contact admin directly: @alexccseller`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '💬 Contact Admin (@alexccseller)', url: 'https://t.me/alexccseller' }
+            ]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
   // ── Bare TG- key detection ──
-  const upperText = text.toUpperCase().trim();
+  const upperText = cleanText.toUpperCase();
   if (/^TG-[A-Z0-9]+$/.test(upperText)) {
     await sendMsg(chatId,
       `🔑 <b>License key detected!</b>\n\n` +
@@ -280,7 +359,7 @@ async function handleBotMessage(message) {
 
   // ── Signup command ──
   if (lower.startsWith('signup') || lower.startsWith('/signup')) {
-    const parts = text.trim().split(/\s+/);
+    const parts = cleanText.split(/\s+/);
     if (parts.length < 2) {
       await sendMsg(chatId,
         `⚠️ <b>Please include your license key!</b>\n` +
@@ -321,17 +400,186 @@ async function handleBotMessage(message) {
   // ── Cancel ──
   if (lower === 'cancel' || lower === '/cancel') {
     pendingSignups.delete(chatId);
-    await sendMsg(chatId, `❌ Signup cancelled. Type <code>signup YOUR_KEY</code> to start again.`);
+    await sendMsg(chatId, `❌ Action cancelled.`);
     return;
   }
 
-  // ── Default ──
+  // ── Smart Helper Fallback (Garena OTP Assistant) ──
   await sendMsg(chatId,
-    `❓ <b>Unknown command.</b>\n\n` +
+    `👋 <b>Garena OTP Assistant Bot</b>\n\n` +
     `• <code>signup TG-XXXXXXXX</code> — Register license key\n` +
     `• <code>otp</code> — Get your Garena OTP\n` +
-    `• <code>logout</code> — Switch to a different license\n` +
-    `• <code>cancel</code> — Cancel current action`);
+    `• <code>logout</code> — Switch license key\n` +
+    `• <code>clear</code> — Wipe chat history\n\n` +
+    `💬 <b>Contact Admin:</b> @alexccseller`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '💬 Contact Admin (@alexccseller)', url: 'https://t.me/alexccseller' }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+// ─────────────────────────────────────────────
+// TELEGRAM STORE & ACCOUNT CATALOG FLOW
+// ─────────────────────────────────────────────
+async function handleStoreCommand(chatId) {
+  await sendMsg(chatId,
+    `🛒 <b>FF Trusted Deals — Game Account Catalog</b>\n\n` +
+    `Select your budget/price category to view available Free Fire accounts:`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '💰 ₹300 IDs', callback_data: 'store_price_300' },
+            { text: '💰 ₹500 IDs', callback_data: 'store_price_500' }
+          ],
+          [
+            { text: '💰 ₹1,000 IDs', callback_data: 'store_price_1000' },
+            { text: '💰 ₹1,500 IDs', callback_data: 'store_price_1500' }
+          ],
+          [
+            { text: '💰 ₹2,000 IDs', callback_data: 'store_price_2000' },
+            { text: '💰 ₹3,000 IDs', callback_data: 'store_price_3000' }
+          ],
+          [
+            { text: '💰 ₹5,000 IDs', callback_data: 'store_price_5000' },
+            { text: '💰 ₹7,000 IDs', callback_data: 'store_price_7000' }
+          ],
+          [
+            { text: '🔍 Show All Available IDs', callback_data: 'store_price_all' }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+async function handleStoreCategory(chatId, priceLimit) {
+  if (!_db) {
+    await sendMsg(chatId, `⚠️ <b>Server not ready yet.</b> Please try again in a moment.`);
+    return;
+  }
+
+  try {
+    // Parallel Firestore collection queries for maximum speed ⚡
+    const [gSnap, zSnap, iSnap, fSnap] = await Promise.all([
+      _db.collection('gmail_credentials').get(),
+      _db.collection('zoho_credentials').get(),
+      _db.collection('imap_credentials').get(),
+      _db.collection('ff_store').get()
+    ]);
+
+    const allDocs = [];
+    gSnap.forEach(docSnap => allDocs.push(docSnap.data()));
+    zSnap.forEach(docSnap => allDocs.push(docSnap.data()));
+    iSnap.forEach(docSnap => allDocs.push(docSnap.data()));
+
+    fSnap.forEach(docSnap => {
+      const data = docSnap.data();
+      allDocs.push({
+        game_id_name: data.title || data.game_id_name || 'FF Store Rare Account',
+        price_inr: data.price || data.price_inr,
+        instagram_link: data.instagram_link || data.mediaUrl || 'https://www.instagram.com/ff_trusted_deals1/',
+        youtube_link: data.youtube_link || (data.mediaType === 'video' ? data.mediaUrl : '')
+      });
+    });
+
+    // STRICT FILTERING RULES:
+    // 1. MUST have instagram_link (non-empty string)
+    // 2. MUST have price_inr > 0
+    // 3. If priceLimit !== 'all', price_inr <= Number(priceLimit)
+    const validAccounts = allDocs.filter(item => {
+      const instaLink = item.instagram_link ? String(item.instagram_link).trim() : '';
+      const price = item.price_inr !== undefined && item.price_inr !== null ? Number(item.price_inr) : 0;
+      
+      if (!instaLink || price <= 0) return false;
+
+      if (priceLimit !== 'all') {
+        const maxPrice = Number(priceLimit);
+        if (price > maxPrice) return false;
+      }
+      return true;
+    });
+
+    if (validAccounts.length === 0) {
+      await sendMsg(chatId,
+        `❌ <b>No accounts available ${priceLimit === 'all' ? 'right now' : `in ₹${priceLimit} category`}!</b>\n\n` +
+        `⏳ <b>Next Restock / Available Time:</b>\n` +
+        `<i>Stock updates daily at 12:00 PM & 06:00 PM IST</i>\n\n` +
+        `💬 <b>Contact Admin directly on Telegram:</b> @alexccseller`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '💬 Contact Admin (@alexccseller)', url: 'https://t.me/alexccseller' }
+              ],
+              [
+                { text: '📸 Visit Instagram Deals Page', url: 'https://www.instagram.com/ff_trusted_deals1/' }
+              ]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    // Sort cheapest first
+    validAccounts.sort((a, b) => Number(a.price_inr || 0) - Number(b.price_inr || 0));
+
+    // Send catalog header + items concurrently ⚡
+    const displayList = validAccounts.slice(0, 10);
+
+    let summaryText = `🛒 <b>FF Trusted Deals Catalog</b>\n` +
+                      `Price Filter: <b>${priceLimit === 'all' ? 'All Available IDs' : `Up to ₹${priceLimit}`}</b>\n` +
+                      `Found: <b>${validAccounts.length} Account(s)</b>\n\n` +
+                      `💬 <b>Contact Admin:</b> @alexccseller`;
+
+    await sendMsg(chatId, summaryText);
+
+    // Send all matched account cards concurrently
+    const sendPromises = displayList.map(item => {
+      const idName = item.game_id_name || 'Free Fire Rare Account';
+      const price = item.price_inr;
+      const rawInsta = String(item.instagram_link).trim();
+      const instaUrl = rawInsta.startsWith('http') ? rawInsta : `https://${rawInsta}`;
+      const rawYt = item.youtube_link ? String(item.youtube_link).trim() : '';
+      const ytUrl = rawYt ? (rawYt.startsWith('http') ? rawYt : `https://${rawYt}`) : '';
+
+      let cardText = `🎯 <b>ID Name:</b> ${idName}\n` +
+                     `💰 <b>Price:</b> ₹${price}\n` +
+                     `📸 <b>Insta Link:</b> ${instaUrl}`;
+
+      if (ytUrl) {
+        cardText += `\n🔴 <b>YouTube Stream:</b> ${ytUrl}`;
+      }
+
+      cardText += `\n💬 <b>Contact Admin:</b> @alexccseller`;
+
+      return sendMsg(chatId, cardText, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '💬 Contact Admin (@alexccseller)', url: 'https://t.me/alexccseller' }
+            ],
+            [
+              { text: '📸 Contact on Instagram', url: 'https://www.instagram.com/ff_trusted_deals1/' }
+            ]
+          ]
+        }
+      });
+    });
+
+    await Promise.all(sendPromises);
+
+  } catch (err) {
+    console.error("Store catalog fetch error:", err.message);
+    await sendMsg(chatId, `⚠️ <b>Error fetching catalog:</b> ${err.message}`);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -574,11 +822,14 @@ async function handleSignupConversation(chatId, text) {
       // Clear state
       pendingSignups.delete(chatId);
 
+      const ffUid = state.keyData?.game_uid || state.keyData?.ff_uid || state.keyData?.gameUid || '';
+
       await sendMsg(chatId,
         `🎉 <b>Account Created Successfully!</b>\n\n` +
         `👤 <b>Name:</b> ${displayName}\n` +
         `📧 <b>Login Email:</b> <code>${state.email}</code>\n` +
         `🎮 <b>Garena Mailbox:</b>\n<code>${state.availableEmail}</code>\n` +
+        (ffUid ? `🎯 <b>Free Fire UID:</b> <code>${ffUid}</code>\n` : '') +
         `⏳ <b>Expires:</b> ${new Date(expiryTime).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n\n` +
         `👉 Copy the Garena mailbox email above and use it to sign in on Garena.\n` +
         `When Garena sends the OTP, come back and type <code>otp</code>`);
@@ -640,14 +891,7 @@ async function handleOtp(chatId) {
   let credData = null;
 
   try {
-    // Use Admin SDK (_db) — bypasses Firestore security rules completely, zero 403 errors
-    const snap = await _db.collection('imap_credentials').where('imap_email', '==', mailboxEmail).get();
-    if (!snap.empty) {
-      snap.forEach(d => { credData = d.data(); });
-    } else {
-      const snap2 = await _db.collection('imap_credentials').where('email', '==', mailboxEmail).get();
-      if (!snap2.empty) snap2.forEach(d => { credData = d.data(); });
-    }
+    credData = await findCredDataForEmail(mailboxEmail);
   } catch (err) {
     await sendMsg(chatId, `❌ <b>Credential lookup failed.</b>\n<i>${err.message}</i>`);
     return;
@@ -720,7 +964,8 @@ async function handleOtp(chatId) {
           linkedZoho: '',
           otpUsed: true,
           otpScanCount: newCount,
-          lastOtpScannedAt: Date.now()
+          lastOtpScannedAt: Date.now(),
+          lastOtpViewedAt: new Date().toISOString()
         });
       }
     } catch (e) { console.error('Auto-unlink error:', e.message); }
@@ -740,39 +985,92 @@ async function handleOtp(chatId) {
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
+async function findCredDataForEmail(mailboxEmail) {
+  if (!mailboxEmail) return null;
+  const targetEmail = mailboxEmail.toLowerCase().trim();
+
+  // Query all 3 collections in parallel using Admin SDK
+  const [gSnap, zSnap, iSnap] = await Promise.all([
+    _db.collection('gmail_credentials').get(),
+    _db.collection('zoho_credentials').get(),
+    _db.collection('imap_credentials').get()
+  ]);
+
+  const allCredDocs = [];
+  gSnap.forEach(d => allCredDocs.push({ ...d.data(), _col: 'gmail' }));
+  zSnap.forEach(d => allCredDocs.push({ ...d.data(), _col: 'zoho' }));
+  iSnap.forEach(d => allCredDocs.push({ ...d.data(), _col: 'imap' }));
+
+  for (const data of allCredDocs) {
+    const email = (data.gmail_email || data.zoho_email || data.imap_email || data.email || data.imap_user || data.user || '').toLowerCase().trim();
+    if (email === targetEmail) {
+      return data;
+    }
+  }
+  return null;
+}
+
 async function findUnassignedMailbox() {
-  // Both reads use Admin SDK — bypasses Firestore rules, no 403 issues
-  const credSnap = await _db.collection('imap_credentials').get();
-  const sessSnap = await _db.collection('telegram_user_sessions').get();
+  // Query all 3 credential collections using Admin SDK
+  const [gSnap, zSnap, iSnap, sessSnap] = await Promise.all([
+    _db.collection('gmail_credentials').get(),
+    _db.collection('zoho_credentials').get(),
+    _db.collection('imap_credentials').get(),
+    _db.collection('telegram_user_sessions').get()
+  ]);
+
   const usedEmails = new Set();
   sessSnap.forEach(d => {
     const e = d.data().assignedMailboxEmail;
-    if (e) usedEmails.add(e);
+    if (e) usedEmails.add(e.toLowerCase().trim());
   });
 
-  for (const doc of credSnap.docs) {
-    const data = doc.data();
-    const email = data.imap_email || data.email;
+  const allCredDocs = [];
+  gSnap.forEach(d => allCredDocs.push({ ...d.data(), _col: 'gmail' }));
+  zSnap.forEach(d => allCredDocs.push({ ...d.data(), _col: 'zoho' }));
+  iSnap.forEach(d => allCredDocs.push({ ...d.data(), _col: 'imap' }));
+
+  for (const data of allCredDocs) {
+    const email = (data.gmail_email || data.zoho_email || data.imap_email || data.email || data.imap_user || '').toLowerCase().trim();
     if (!email) continue;
     if (!usedEmails.has(email)) return email;
   }
   return null;
 }
 
-
 async function fetchInboxMessages(credData) {
-  // Call the same /imap/fetch endpoint that the website uses
-  // This guarantees identical behavior - no duplicate ImapFlow code
+  const email = (credData.gmail_email || credData.zoho_email || credData.imap_email || credData.email || credData.imap_user || credData.user || '').toLowerCase().trim();
+  
+  let host = credData.imap_host || credData.host || '';
+  if (!host) {
+    if (email.endsWith('@gmail.com') || credData._col === 'gmail') {
+      host = 'imap.gmail.com';
+    } else if (email.includes('@zoho') || credData._col === 'zoho') {
+      host = 'imap.zoho.in';
+    } else {
+      host = 'imap.gmail.com';
+    }
+  }
+
+  const port = Number(credData.imap_port || credData.port || 993);
+  const user = credData.imap_user || email;
+  const pass = credData.imap_password || credData.gmail_app_password || credData.zoho_password || credData.password || credData.pass || credData.app_password || credData.gmail_refresh_token || credData.zoho_refresh_token;
+  const secure = credData.imap_secure !== false;
+
+  if (!pass) {
+    throw new Error(`Password / App Password is missing for ${email} in Email Monitor.`);
+  }
+
   const PORT = process.env.PORT || 8080;
   const res = await fetch(`http://localhost:${PORT}/imap/fetch`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      host: credData.imap_host,
-      port: credData.imap_port,
-      user: credData.imap_user || credData.imap_email,   // website uses imap_user
-      pass: credData.imap_password,
-      secure: credData.imap_secure !== false,
+      host,
+      port,
+      user,
+      pass,
+      secure,
       folders: ['INBOX'],
       limit: 15
     })
