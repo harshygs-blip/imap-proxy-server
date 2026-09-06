@@ -633,12 +633,24 @@ const handleGarenaOtpRequest = async (req, res) => {
     // --- Branch A: Gmail OAuth accounts (stored in gmail_credentials with gmail_refresh_token) ---
     if (foundDoc._type === 'gmail' && foundDoc.gmail_refresh_token) {
       console.log(`[API /api/otp/garena] Fetching OTP for ${foundDoc.email} via Google Gmail API...`);
-      try {
-        const clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET || process.env.VITE_GOOGLE_CLIENT_SECRET;
+        let clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
+        let clientSecret = process.env.GOOGLE_CLIENT_SECRET || process.env.VITE_GOOGLE_CLIENT_SECRET;
 
         if (!clientId || !clientSecret) {
-          console.error('[API /api/otp/garena] Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment variables.');
+          try {
+            const googleConfigDoc = await db.collection('system_settings').doc('google_oauth').get();
+            if (googleConfigDoc.exists) {
+              const gData = googleConfigDoc.data();
+              clientId = clientId || gData.clientId;
+              clientSecret = clientSecret || gData.clientSecret;
+            }
+          } catch (cfgErr) {
+            console.warn('[API /api/otp/garena] Error loading google_oauth from Firestore:', cfgErr.message);
+          }
+        }
+
+        if (!clientId || !clientSecret) {
+          console.error('[API /api/otp/garena] Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment or Firestore.');
         }
 
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
