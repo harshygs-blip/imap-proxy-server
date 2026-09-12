@@ -142,10 +142,20 @@ const verifyApiKey = (req, res, next) => {
 };
 
 // ------------------------------------------------------------
-// Production Security 3: Lock Root & Sensitive Probe Routes (Anti-Reconnaissance)
+// Production Health Check & Status Endpoint
 // ------------------------------------------------------------
 app.get('/', (req, res) => {
-  res.status(404).send('Not Found');
+  res.status(200).json({
+    status: 'online',
+    service: 'IMAP & Mail Proxy Server',
+    uptime: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+    message: 'Proxy server is operational and ready to process requests.'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: Math.round(process.uptime()) });
 });
 
 app.all(['/accounts', '/list', '/debug', '/api/accounts', '/users', '/credentials'], (req, res) => {
@@ -190,8 +200,13 @@ app.post('/imap/test', async (req, res) => {
     await client.logout();
     res.json({ success: true, message: 'IMAP connection verified successfully.', folders: folderNames });
   } catch (err) {
-    console.error('IMAP test failed:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to connect to IMAP server.' });
+    const rawError = err.responseText || err.response || err.message || 'Failed to connect to IMAP server.';
+    console.error('IMAP test failed:', rawError);
+    let userFriendly = rawError;
+    if (String(rawError).includes('You are yet to enable IMAP') || String(rawError).includes('enable IMAP')) {
+      userFriendly = 'IMAP Access is disabled in Zoho Mail. Please log in to Zoho Mail (zoho.in) -> Settings -> Mail Accounts -> Check "Enable IMAP Access".';
+    }
+    res.status(400).json({ error: userFriendly, raw: rawError });
   }
 });
 
@@ -292,8 +307,13 @@ app.post('/imap/fetch', async (req, res) => {
 
     res.json({ data: allMessages });
   } catch (err) {
-    console.error('IMAP fetch failed:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to fetch messages.' });
+    const rawError = err.responseText || err.response || err.message || 'Failed to fetch messages.';
+    console.error('IMAP fetch failed:', rawError);
+    let userFriendly = rawError;
+    if (String(rawError).includes('You are yet to enable IMAP') || String(rawError).includes('enable IMAP')) {
+      userFriendly = 'IMAP Access is disabled in Zoho Mail for this account. Please log in to Zoho Mail (zoho.in) -> Settings -> Mail Accounts -> Check "Enable IMAP Access".';
+    }
+    res.status(400).json({ error: userFriendly, raw: rawError });
   }
 });
 
