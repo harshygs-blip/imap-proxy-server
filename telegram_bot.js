@@ -192,11 +192,46 @@ async function editMsgText(chatId, messageId, text, options = {}) {
   }
 }
 
+// ─────────────────────────────────────────────
+// BOT ENABLE / DISABLE STATUS CHECK
+// ─────────────────────────────────────────────
+let botEnabledStatus = { is_enabled: true, maintenance_message: '', lastChecked: 0 };
+
+async function getBotStatus() {
+  const now = Date.now();
+  // Cache for 3 seconds so status check is nearly real-time without slamming Firestore
+  if (now - botEnabledStatus.lastChecked < 3000) {
+    return botEnabledStatus;
+  }
+  try {
+    const doc = await firestoreGet('system_settings/telegram_bot');
+    if (doc && doc.exists && doc.data) {
+      botEnabledStatus = {
+        is_enabled: doc.data.is_enabled !== false,
+        maintenance_message: doc.data.maintenance_message || '',
+        lastChecked: now
+      };
+    } else {
+      botEnabledStatus = { is_enabled: true, maintenance_message: '', lastChecked: now };
+    }
+  } catch (e) {
+    console.warn("Could not check bot status:", e.message);
+  }
+  return botEnabledStatus;
+}
+
 // Handle Callback Queries (Button Clicks)
 async function handleCallbackQuery(callbackQuery) {
   const chatId = String(callbackQuery.message.chat.id);
   const messageId = callbackQuery.message.message_id;
   const data = callbackQuery.data;
+
+  // Verify if bot is currently enabled
+  const botStatus = await getBotStatus();
+  if (!botStatus.is_enabled) {
+    await answerCallbackQuery(callbackQuery.id, '⚠️ Bot is currently disabled for maintenance.');
+    return;
+  }
 
   if (data === 'agree_terms') {
     await answerCallbackQuery(callbackQuery.id, '✅ Thank you for agreeing!');
@@ -301,6 +336,18 @@ async function handleBotMessage(message) {
   // ── Clear / Clean command ──
   if (['clear', '/clear', 'clean', '/clean'].includes(lower)) {
     await clearChat(chatId, msgId);
+    return;
+  }
+
+  // ── Check if bot is disabled by Administrator ──
+  const botStatus = await getBotStatus();
+  if (!botStatus.is_enabled) {
+    const notice = botStatus.maintenance_message && botStatus.maintenance_message.trim()
+      ? botStatus.maintenance_message.trim()
+      : `⚠️ <b>Telegram Bot is Currently Disabled</b>\n\n` +
+        `The bot is temporarily disabled for scheduled maintenance by administrator.\n\n` +
+        `Please check back shortly or contact administrator: <b>@alexccseller</b>`;
+    await sendMsg(chatId, notice);
     return;
   }
 

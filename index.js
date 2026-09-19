@@ -90,7 +90,7 @@ app.set('trust proxy', 1);
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-api-key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'x-api-key', 'Bypass-Tunnel-Reminder', 'bypass-tunnel-reminder']
 }));
 app.options('*', cors());
 app.use(express.json());
