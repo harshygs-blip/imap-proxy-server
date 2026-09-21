@@ -1,6 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import admin from 'firebase-admin';
@@ -933,8 +936,300 @@ app.get('/api/garena/otp', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest)
 app.post('/api/garena/otp', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
 
 // ============================================================
-// 5. GET & POST /api/customer/info — Full Customer Profile, License Key & T&C Acceptance
+// 5. SECURE CUSTOMER API (/api/customer/info & Aliases)
+// Hardened with API Key Auth, Upstash Rate Limiting, Input Validation & Data Minimization
 // ============================================================
+
+// 5.1 Constant-Time Key Verification
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length === 0 || bufB.length === 0 || bufA.length !== bufB.length) {
+    const dummy = Buffer.alloc(32, 0);
+    crypto.timingSafeEqual(dummy, dummy);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// 5.2 Strict CORS for Customer Endpoints (Restricted to Owner Domains)
+const ALLOWED_CUSTOMER_ORIGINS = [
+  'https://dealsbyshiv.web.app',
+  'https://ff-store-4a61e.web.app',
+  'https://dealsbyshiv.firebaseapp.com',
+  'https://ff-store-4a61e.firebaseapp.com'
+];
+
+if (process.env.ALLOWED_ORIGINS) {
+  process.env.ALLOWED_ORIGINS.split(',').forEach(orig => {
+    const cleanOrig = orig.trim();
+    if (cleanOrig && !ALLOWED_CUSTOMER_ORIGINS.includes(cleanOrig)) {
+      ALLOWED_CUSTOMER_ORIGINS.push(cleanOrig);
+    }
+  });
+}
+
+const customerCorsMiddleware = (req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    const isAllowed = ALLOWED_CUSTOMER_ORIGINS.includes(origin) ||
+      (process.env.NODE_ENV !== 'production' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin));
+
+    if (isAllowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
+      res.setHeader('Access-Control-Max-Age', '86400');
+    } else {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Forbidden'
+      });
+    }
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+};
+
+// 5.3 Security Headers Middleware
+const customerSecurityHeaders = (req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'none'");
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+};
+
+// 5.4 Rate Limiting with @upstash/ratelimit (30 req/min per IP)
+let upstashCustomerRatelimit = null;
+const upstashUrl = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+
+if (upstashUrl && upstashToken) {
+  try {
+    const redis = new Redis({
+      url: upstashUrl,
+      token: upstashToken
+    });
+    upstashCustomerRatelimit = new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(30, '60 s'),
+      analytics: false,
+      prefix: 'ratelimit:customer_info'
+    });
+  } catch (rlInitErr) {
+    console.error('[RateLimit] Failed to initialize Upstash Redis:', rlInitErr.message);
+  }
+}
+
+const customerFallbackLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({
+      success: false,
+      error: 'Too Many Requests',
+      message: 'Rate limit exceeded. Maximum 30 requests per minute. Please try again later.'
+    });
+  }
+});
+
+const customerRateLimiter = async (req, res, next) => {
+  if (upstashCustomerRatelimit) {
+    try {
+      const clientIp = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '127.0.0.1')
+        .toString()
+        .split(',')[0]
+        .trim();
+
+      const { success, limit, remaining, reset } = await upstashCustomerRatelimit.limit(clientIp);
+
+      res.setHeader('X-RateLimit-Limit', limit);
+      res.setHeader('X-RateLimit-Remaining', remaining);
+      res.setHeader('X-RateLimit-Reset', reset);
+
+      if (!success) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((reset - Date.now()) / 1000));
+        res.setHeader('Retry-After', retryAfterSeconds);
+        return res.status(429).json({
+          success: false,
+          error: 'Too Many Requests',
+          message: 'Rate limit exceeded. Maximum 30 requests per minute. Please try again later.'
+        });
+      }
+      return next();
+    } catch (rlErr) {
+      console.error('[RateLimit] Upstash limit error, falling back to local limiter:', rlErr.message);
+      return customerFallbackLimiter(req, res, next);
+    }
+  } else {
+    return customerFallbackLimiter(req, res, next);
+  }
+};
+
+// 5.5 API Key Authentication Middleware (x-api-key header required on EVERY request)
+const verifyCustomerAuth = (req, res, next) => {
+  const apiKeyHeader = req.headers['x-api-key'];
+
+  if (!apiKeyHeader || typeof apiKeyHeader !== 'string') {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized',
+      message: 'Unauthorized'
+    });
+  }
+
+  const providedKey = apiKeyHeader.trim();
+  const customerKey = process.env.CUSTOMER_API_KEY || '';
+  const adminKey = process.env.ADMIN_API_KEY || '';
+
+  const isAdmin = adminKey.length > 0 && timingSafeEqualStr(providedKey, adminKey);
+  const isCustomer = customerKey.length > 0 && timingSafeEqualStr(providedKey, customerKey);
+
+  if (!isAdmin && !isCustomer) {
+    return res.status(401).json({
+      success: false,
+      error: 'Unauthorized',
+      message: 'Unauthorized'
+    });
+  }
+
+  req.isAdmin = isAdmin;
+  req.isCustomer = isCustomer;
+  next();
+};
+
+// 5.6 Input Validation & Query Hardening Middleware
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+const KEY_REGEX = /^[A-Za-z0-9\-_]{4,64}$/;
+const MOBILE_REGEX = /^\d{10}$/;
+const UID_REGEX = /^[A-Za-z0-9_-]{20,36}$/;
+
+const validateCustomerQueryParams = (req, res, next) => {
+  const query = req.query || {};
+  const recognizedParams = ['email', 'key', 'licenseKey', 'mobile', 'uid', 'all'];
+  const presentParams = [];
+
+  for (const param of recognizedParams) {
+    if (query[param] !== undefined && query[param] !== null && String(query[param]).trim() !== '') {
+      presentParams.push(param);
+    }
+  }
+
+  // Require exactly ONE lookup param per request (reject empty queries)
+  if (presentParams.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'Bad Request',
+      message: 'Missing lookup parameter. Exactly one of ?email, ?key, ?mobile, ?uid, or ?all=true is required.'
+    });
+  }
+
+  // Reject ?email=X&key=Y combos
+  if (presentParams.length > 1) {
+    return res.status(400).json({
+      success: false,
+      error: 'Bad Request',
+      message: 'Multiple lookup parameters provided. Please provide exactly one lookup parameter.'
+    });
+  }
+
+  const lookupType = presentParams[0];
+  const rawValue = String(query[lookupType]).trim();
+
+  if (lookupType === 'email') {
+    if (rawValue.length > 254 || !EMAIL_REGEX.test(rawValue)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request',
+        message: 'Invalid email format.'
+      });
+    }
+    req.validatedLookup = { type: 'email', value: rawValue.toLowerCase() };
+  } else if (lookupType === 'key' || lookupType === 'licenseKey') {
+    if (!KEY_REGEX.test(rawValue)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request',
+        message: 'Invalid license key format.'
+      });
+    }
+    req.validatedLookup = { type: 'key', value: rawValue };
+  } else if (lookupType === 'mobile') {
+    if (!MOBILE_REGEX.test(rawValue)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request',
+        message: 'Invalid mobile number format. Expected exactly 10 digits.'
+      });
+    }
+    req.validatedLookup = { type: 'mobile', value: rawValue };
+  } else if (lookupType === 'uid') {
+    if (!UID_REGEX.test(rawValue)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request',
+        message: 'Invalid UID format.'
+      });
+    }
+    req.validatedLookup = { type: 'uid', value: rawValue };
+  } else if (lookupType === 'all') {
+    if (rawValue !== 'true') {
+      return res.status(400).json({
+        success: false,
+        error: 'Bad Request',
+        message: 'Invalid value for ?all parameter. Expected ?all=true.'
+      });
+    }
+    // Lock down ?all=true behind ADMIN_API_KEY
+    if (!req.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Forbidden'
+      });
+    }
+    req.validatedLookup = { type: 'all', value: true };
+  }
+
+  next();
+};
+
+// 5.7 PII Masking Utilities
+function maskEmail(email) {
+  if (!email || typeof email !== 'string' || !email.includes('@')) return '***@***.com';
+  const [user, domain] = email.split('@');
+  const firstChar = user.charAt(0) || 'u';
+  return `${firstChar}***@${domain}`;
+}
+
+function maskMobile(mobile) {
+  if (!mobile) return null;
+  const digits = String(mobile).replace(/\D/g, '');
+  if (digits.length >= 10) {
+    const start = digits.slice(0, 4);
+    const end = digits.slice(-2);
+    return `${start}****${end}`;
+  }
+  if (digits.length >= 6) {
+    return `${digits.slice(0, 2)}****${digits.slice(-2)}`;
+  }
+  return '****';
+}
+
 function formatFirestoreDate(ts) {
   if (!ts) return null;
   let dateObj = null;
@@ -955,59 +1250,55 @@ function formatFirestoreDate(ts) {
 const handleCustomerInfoRequest = async (req, res) => {
   try {
     if (!db) {
-      return res.status(500).json({ success: false, error: 'Database service is not initialized on proxy server.' });
+      return res.status(500).json({
+        success: false,
+        error: 'Internal Server Error',
+        message: 'An internal error occurred.'
+      });
     }
 
-    const emailParam = req.query.email || req.body.email || '';
-    const keyParam = req.query.key || req.body.key || req.query.licenseKey || req.body.licenseKey || '';
-    const uidParam = req.query.uid || req.body.uid || '';
-    const mobileParam = req.query.mobile || req.body.mobile || '';
-    const queryParam = req.query.query || req.body.query || req.query.q || '';
-    const isAll = req.query.all === 'true' || req.body.all === true || (!emailParam && !keyParam && !uidParam && !mobileParam && !queryParam);
-
+    const { type, value } = req.validatedLookup;
     let userDocs = [];
 
-    if (uidParam && uidParam.trim()) {
-      const docSnap = await db.collection('users').doc(uidParam.trim()).get();
+    if (type === 'uid') {
+      const docSnap = await db.collection('users').doc(value).get();
       if (docSnap.exists) userDocs.push(docSnap);
-    } else if (emailParam && emailParam.trim()) {
-      const snap = await db.collection('users').where('email', '==', emailParam.toLowerCase().trim()).get();
+    } else if (type === 'email') {
+      const snap = await db.collection('users').where('email', '==', value).get();
       snap.forEach(d => userDocs.push(d));
-    } else if (mobileParam && mobileParam.trim()) {
-      const snap = await db.collection('users').where('mobile', '==', mobileParam.trim()).get();
-      snap.forEach(d => userDocs.push(d));
-    } else if (keyParam && keyParam.trim()) {
-      const cleanKey = keyParam.trim();
-      const snapByKey = await db.collection('users').where('usedLicenseKey', '==', cleanKey).get();
+    } else if (type === 'mobile') {
+      const snapStr = await db.collection('users').where('mobile', '==', value).get();
+      snapStr.forEach(d => userDocs.push(d));
+      if (userDocs.length === 0 && !isNaN(Number(value))) {
+        const snapNum = await db.collection('users').where('mobile', '==', Number(value)).get();
+        snapNum.forEach(d => userDocs.push(d));
+      }
+    } else if (type === 'key') {
+      const snapByKey = await db.collection('users').where('usedLicenseKey', '==', value).get();
       snapByKey.forEach(d => userDocs.push(d));
 
       if (userDocs.length === 0) {
-        // Search in license_keys collection to find who redeemed it
-        const lkSnap = await db.collection('license_keys').doc(cleanKey).get();
+        const lkSnap = await db.collection('license_keys').doc(value).get();
         if (lkSnap.exists && lkSnap.data().redeemedBy) {
           const uSnap = await db.collection('users').doc(lkSnap.data().redeemedBy).get();
           if (uSnap.exists) userDocs.push(uSnap);
+        } else {
+          const tgKeySnap = await db.collection('telegram_license_keys').doc(value).get();
+          if (tgKeySnap.exists) {
+            const tgData = tgKeySnap.data();
+            const targetUid = tgData.redeemedBy || tgData.boundToUid || tgData.usedBy;
+            if (targetUid) {
+              const uSnap = await db.collection('users').doc(targetUid).get();
+              if (uSnap.exists) userDocs.push(uSnap);
+            }
+          }
         }
       }
-    } else if (queryParam && queryParam.trim()) {
-      const qLower = queryParam.toLowerCase().trim();
+    } else if (type === 'all' && req.isAdmin) {
       const allSnap = await db.collection('users').limit(100).get();
       allSnap.forEach(d => {
-        const u = d.data();
-        if (
-          d.id.toLowerCase() === qLower ||
-          (u.email && u.email.toLowerCase().includes(qLower)) ||
-          (u.name && u.name.toLowerCase().includes(qLower)) ||
-          (u.mobile && String(u.mobile).includes(qLower)) ||
-          (u.usedLicenseKey && u.usedLicenseKey.toLowerCase().includes(qLower))
-        ) {
-          userDocs.push(d);
-        }
-      });
-    } else if (isAll) {
-      const allSnap = await db.collection('users').limit(100).get();
-      allSnap.forEach(d => {
-        if (d.data().role === 'client' || d.data().usedLicenseKey || d.data().termsAccepted) {
+        const data = d.data();
+        if (data.role === 'client' || data.usedLicenseKey || data.termsAccepted) {
           userDocs.push(d);
         }
       });
@@ -1033,7 +1324,7 @@ const handleCustomerInfoRequest = async (req, res) => {
         const subSnap = await db.collection('subscriptions').doc(uid).get();
         if (subSnap.exists) subData = subSnap.data();
       } catch (e) {
-        console.warn("Sub fetch error:", e.message);
+        console.warn('Sub fetch warning:', e.message);
       }
 
       // 2. Resolve License Key
@@ -1048,7 +1339,7 @@ const handleCustomerInfoRequest = async (req, res) => {
             if (tgKeySnap.exists) keyDocData = tgKeySnap.data();
           }
         } catch (e) {
-          console.warn("Key doc error:", e.message);
+          console.warn('Key doc warning:', e.message);
         }
       }
 
@@ -1071,7 +1362,7 @@ const handleCustomerInfoRequest = async (req, res) => {
           }
         }
       } catch (e) {
-        console.warn("Session fetch error:", e.message);
+        console.warn('Session fetch warning:', e.message);
       }
 
       const acceptedAtFormatted = formatFirestoreDate(u.termsAcceptedAt || termsSession?.timestamp);
@@ -1083,12 +1374,44 @@ const handleCustomerInfoRequest = async (req, res) => {
       const remainingMs = expiryFormatted ? Math.max(0, expiryFormatted.timestampMs - Date.now()) : 0;
       const remainingHours = Math.round((remainingMs / (1000 * 60 * 60)) * 10) / 10;
 
+      // Data Minimization: Full unmasked PII only if admin
+      const emailValue = req.isAdmin ? (u.email || 'No email') : maskEmail(u.email || 'No email');
+      const mobileValue = req.isAdmin ? (u.mobile || null) : maskMobile(u.mobile || null);
+      const assignedMailboxRaw = keyDocData?.assignedMailbox || u.linkedGmail || u.linkedZoho || u.linkedImap || null;
+      const assignedMailboxValue = req.isAdmin ? assignedMailboxRaw : (assignedMailboxRaw ? maskEmail(assignedMailboxRaw) : null);
+
+      // Audit proof device fingerprint stripping:
+      // Single-customer lookups must NOT return: ipAddress, userAgent, screenResolution, platform, connectionType, or device fingerprints.
+      let auditProofData = null;
+      if (termsSession) {
+        if (req.isAdmin) {
+          auditProofData = {
+            ipAddress: termsSession.ip || null,
+            userAgent: termsSession.userAgent || null,
+            platform: termsSession.platform || null,
+            country: termsSession.country || null,
+            connectionType: termsSession.connectionType || null,
+            screenResolution: termsSession.screenResolution || null,
+            eventAction: termsSession.eventType || 'Terms Acceptance',
+            eventDetails: termsSession.details || 'Client accepted Terms & Conditions via portal prompt.',
+            sessionRecordedAt: formatFirestoreDate(termsSession.timestamp)
+          };
+        } else {
+          // Device fingerprints stripped entirely for normal API key
+          auditProofData = {
+            eventAction: termsSession.eventType || 'Terms Acceptance',
+            eventDetails: termsSession.details || 'Client accepted Terms & Conditions via portal prompt.',
+            sessionRecordedAt: formatFirestoreDate(termsSession.timestamp)
+          };
+        }
+      }
+
       customerResults.push({
         customer: {
           uid: uid,
           name: u.name || 'Client',
-          email: u.email || 'No email',
-          mobile: u.mobile || null,
+          email: emailValue,
+          mobile: mobileValue,
           role: u.role || 'client',
           status: u.status || 'Active',
           registeredAt: createdAtFormatted,
@@ -1106,7 +1429,7 @@ const handleCustomerInfoRequest = async (req, res) => {
           expiresAt: expiryFormatted,
           isExpired: isExpired,
           remainingHours: remainingHours,
-          assignedMailbox: keyDocData?.assignedMailbox || u.linkedGmail || u.linkedZoho || u.linkedImap || null,
+          assignedMailbox: assignedMailboxValue,
           mailboxType: keyDocData?.mailboxType || (u.linkedGmail ? 'gmail' : u.linkedZoho ? 'zoho' : u.linkedImap ? 'imap' : null)
         },
         termsAndConditions: {
@@ -1125,17 +1448,7 @@ const handleCustomerInfoRequest = async (req, res) => {
             ],
             portalPromptText: 'By accessing or initiating transactions, you agree to our Service Terms. All rented credentials (e.g. Free Fire IDs) are provided for temporary access during specified lease hours.'
           },
-          auditProof: termsSession ? {
-            ipAddress: termsSession.ip || null,
-            userAgent: termsSession.userAgent || null,
-            platform: termsSession.platform || null,
-            country: termsSession.country || null,
-            connectionType: termsSession.connectionType || null,
-            screenResolution: termsSession.screenResolution || null,
-            eventAction: termsSession.eventType || 'Terms Acceptance',
-            eventDetails: termsSession.details || 'Client accepted Terms & Conditions via portal prompt.',
-            sessionRecordedAt: formatFirestoreDate(termsSession.timestamp)
-          } : null
+          auditProof: auditProofData
         },
         otpUsageStats: {
           otpUsed: u.otpUsed === true,
@@ -1146,7 +1459,7 @@ const handleCustomerInfoRequest = async (req, res) => {
       });
     }
 
-    if (customerResults.length === 1 && !isAll) {
+    if (customerResults.length === 1 && type !== 'all') {
       return res.status(200).json({
         success: true,
         ...customerResults[0]
@@ -1160,21 +1473,37 @@ const handleCustomerInfoRequest = async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[API /api/customer/info] Error:', err);
+    console.error('[API /api/customer/info] Internal error:', err.message);
+    // Never leak stack traces or internal errors to client
     return res.status(500).json({
       success: false,
-      error: 'INTERNAL_SERVER_ERROR',
-      message: err.message
+      error: 'Internal Server Error',
+      message: 'An internal error occurred.'
     });
   }
 };
 
-app.get('/api/customer/info', handleCustomerInfoRequest);
-app.post('/api/customer/info', handleCustomerInfoRequest);
-app.get('/api/customer-details', handleCustomerInfoRequest);
-app.post('/api/customer-details', handleCustomerInfoRequest);
-app.get('/api/terms-acceptance', handleCustomerInfoRequest);
-app.get('/api/license-info', handleCustomerInfoRequest);
+const customerMiddlewareChain = [
+  customerSecurityHeaders,
+  customerCorsMiddleware,
+  customerRateLimiter,
+  verifyCustomerAuth,
+  validateCustomerQueryParams
+];
+
+app.get('/api/customer/info', ...customerMiddlewareChain, handleCustomerInfoRequest);
+app.get('/api/customer-details', ...customerMiddlewareChain, handleCustomerInfoRequest);
+app.get('/api/terms-acceptance', ...customerMiddlewareChain, handleCustomerInfoRequest);
+app.get('/api/license-info', ...customerMiddlewareChain, handleCustomerInfoRequest);
+
+// Reject any non-GET attempts on customer endpoints with 405 Method Not Allowed
+app.all(['/api/customer/info', '/api/customer-details', '/api/terms-acceptance', '/api/license-info'], (req, res) => {
+  res.status(405).json({
+    success: false,
+    error: 'Method Not Allowed',
+    message: 'Only GET requests are permitted on this endpoint.'
+  });
+});
 
 // Catch-all 404 for any unknown route (Scanners / Crawlers receive generic 404)
 app.use((req, res) => {
