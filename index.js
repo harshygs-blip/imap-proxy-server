@@ -932,6 +932,250 @@ app.post('/api/otp/garena', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest
 app.get('/api/garena/otp', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
 app.post('/api/garena/otp', otpRateLimiter, verifyApiKey, handleGarenaOtpRequest);
 
+// ============================================================
+// 5. GET & POST /api/customer/info — Full Customer Profile, License Key & T&C Acceptance
+// ============================================================
+function formatFirestoreDate(ts) {
+  if (!ts) return null;
+  let dateObj = null;
+  if (ts.toDate && typeof ts.toDate === 'function') dateObj = ts.toDate();
+  else if (ts._seconds) dateObj = new Date(ts._seconds * 1000 + (ts._nanoseconds ? ts._nanoseconds / 1e6 : 0));
+  else if (typeof ts === 'number') dateObj = new Date(ts);
+  else if (typeof ts === 'string') dateObj = new Date(ts);
+
+  if (!dateObj || isNaN(dateObj.getTime())) return null;
+
+  return {
+    iso: dateObj.toISOString(),
+    formattedIST: dateObj.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'full', timeStyle: 'medium' }),
+    timestampMs: dateObj.getTime()
+  };
+}
+
+const handleCustomerInfoRequest = async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(500).json({ success: false, error: 'Database service is not initialized on proxy server.' });
+    }
+
+    const emailParam = req.query.email || req.body.email || '';
+    const keyParam = req.query.key || req.body.key || req.query.licenseKey || req.body.licenseKey || '';
+    const uidParam = req.query.uid || req.body.uid || '';
+    const mobileParam = req.query.mobile || req.body.mobile || '';
+    const queryParam = req.query.query || req.body.query || req.query.q || '';
+    const isAll = req.query.all === 'true' || req.body.all === true || (!emailParam && !keyParam && !uidParam && !mobileParam && !queryParam);
+
+    let userDocs = [];
+
+    if (uidParam && uidParam.trim()) {
+      const docSnap = await db.collection('users').doc(uidParam.trim()).get();
+      if (docSnap.exists) userDocs.push(docSnap);
+    } else if (emailParam && emailParam.trim()) {
+      const snap = await db.collection('users').where('email', '==', emailParam.toLowerCase().trim()).get();
+      snap.forEach(d => userDocs.push(d));
+    } else if (mobileParam && mobileParam.trim()) {
+      const snap = await db.collection('users').where('mobile', '==', mobileParam.trim()).get();
+      snap.forEach(d => userDocs.push(d));
+    } else if (keyParam && keyParam.trim()) {
+      const cleanKey = keyParam.trim();
+      const snapByKey = await db.collection('users').where('usedLicenseKey', '==', cleanKey).get();
+      snapByKey.forEach(d => userDocs.push(d));
+
+      if (userDocs.length === 0) {
+        // Search in license_keys collection to find who redeemed it
+        const lkSnap = await db.collection('license_keys').doc(cleanKey).get();
+        if (lkSnap.exists && lkSnap.data().redeemedBy) {
+          const uSnap = await db.collection('users').doc(lkSnap.data().redeemedBy).get();
+          if (uSnap.exists) userDocs.push(uSnap);
+        }
+      }
+    } else if (queryParam && queryParam.trim()) {
+      const qLower = queryParam.toLowerCase().trim();
+      const allSnap = await db.collection('users').limit(100).get();
+      allSnap.forEach(d => {
+        const u = d.data();
+        if (
+          d.id.toLowerCase() === qLower ||
+          (u.email && u.email.toLowerCase().includes(qLower)) ||
+          (u.name && u.name.toLowerCase().includes(qLower)) ||
+          (u.mobile && String(u.mobile).includes(qLower)) ||
+          (u.usedLicenseKey && u.usedLicenseKey.toLowerCase().includes(qLower))
+        ) {
+          userDocs.push(d);
+        }
+      });
+    } else if (isAll) {
+      const allSnap = await db.collection('users').limit(100).get();
+      allSnap.forEach(d => {
+        if (d.data().role === 'client' || d.data().usedLicenseKey || d.data().termsAccepted) {
+          userDocs.push(d);
+        }
+      });
+    }
+
+    if (userDocs.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'CUSTOMER_NOT_FOUND',
+        message: 'No matching customer found with the provided criteria.'
+      });
+    }
+
+    const customerResults = [];
+
+    for (const docSnap of userDocs) {
+      const u = docSnap.data();
+      const uid = docSnap.id;
+
+      // 1. Fetch Subscription details
+      let subData = null;
+      try {
+        const subSnap = await db.collection('subscriptions').doc(uid).get();
+        if (subSnap.exists) subData = subSnap.data();
+      } catch (e) {
+        console.warn("Sub fetch error:", e.message);
+      }
+
+      // 2. Resolve License Key
+      let licenseKeyId = u.usedLicenseKey || (subData?.notes?.match(/License Key:\s*([A-Za-z0-9\-]+)/)?.[1]) || null;
+      let keyDocData = null;
+      if (licenseKeyId) {
+        try {
+          const keySnap = await db.collection('license_keys').doc(licenseKeyId).get();
+          if (keySnap.exists) keyDocData = keySnap.data();
+          else {
+            const tgKeySnap = await db.collection('telegram_license_keys').doc(licenseKeyId).get();
+            if (tgKeySnap.exists) keyDocData = tgKeySnap.data();
+          }
+        } catch (e) {
+          console.warn("Key doc error:", e.message);
+        }
+      }
+
+      // 3. Fetch Terms Acceptance Session Audit Proof
+      let termsSession = null;
+      try {
+        const sessionsSnap = await db.collection('users').doc(uid).collection('sessions')
+          .where('eventType', '==', 'Terms Acceptance')
+          .limit(1)
+          .get();
+        if (!sessionsSnap.empty) {
+          termsSession = sessionsSnap.docs[0].data();
+        } else {
+          const earliestSnap = await db.collection('users').doc(uid).collection('sessions')
+            .orderBy('timestamp', 'asc')
+            .limit(1)
+            .get();
+          if (!earliestSnap.empty) {
+            termsSession = earliestSnap.docs[0].data();
+          }
+        }
+      } catch (e) {
+        console.warn("Session fetch error:", e.message);
+      }
+
+      const acceptedAtFormatted = formatFirestoreDate(u.termsAcceptedAt || termsSession?.timestamp);
+      const createdAtFormatted = formatFirestoreDate(u.createdAt);
+      const expiryFormatted = formatFirestoreDate(subData?.expiryDate);
+      const activatedAtFormatted = formatFirestoreDate(subData?.purchaseDate || keyDocData?.redeemedAt || u.createdAt);
+
+      const isExpired = expiryFormatted ? expiryFormatted.timestampMs < Date.now() : false;
+      const remainingMs = expiryFormatted ? Math.max(0, expiryFormatted.timestampMs - Date.now()) : 0;
+      const remainingHours = Math.round((remainingMs / (1000 * 60 * 60)) * 10) / 10;
+
+      customerResults.push({
+        customer: {
+          uid: uid,
+          name: u.name || 'Client',
+          email: u.email || 'No email',
+          mobile: u.mobile || null,
+          role: u.role || 'client',
+          status: u.status || 'Active',
+          registeredAt: createdAtFormatted,
+          instagram: {
+            id: u.instagramId || null,
+            url: u.instagram_link || (u.instagramId ? `https://instagram.com/${u.instagramId}` : null)
+          }
+        },
+        licenseKey: {
+          key: licenseKeyId,
+          status: subData?.status || keyDocData?.status || (isExpired ? 'Expired' : 'Active'),
+          productName: subData?.productName || 'License Key Activation',
+          validityDays: subData?.validityDays || keyDocData?.validityDays || null,
+          activatedAt: activatedAtFormatted,
+          expiresAt: expiryFormatted,
+          isExpired: isExpired,
+          remainingHours: remainingHours,
+          assignedMailbox: keyDocData?.assignedMailbox || u.linkedGmail || u.linkedZoho || u.linkedImap || null,
+          mailboxType: keyDocData?.mailboxType || (u.linkedGmail ? 'gmail' : u.linkedZoho ? 'zoho' : u.linkedImap ? 'imap' : null)
+        },
+        termsAndConditions: {
+          isAccepted: u.termsAccepted === true,
+          acceptedAt: acceptedAtFormatted,
+          agreementDetails: {
+            title: 'Official Garena Free Fire Escrow, Digital Asset Lease & Credential Usage Terms and Conditions',
+            version: 'v2.4 (September 2026 Production Standard)',
+            termsUrl: 'https://dealsbyshiv.web.app/terms-and-conditions',
+            clausesAccepted: [
+              'Clause 1 (48-Hour Cooldown): Strictly 1 OTP retrieval per 48 hours for anti-abuse and account security.',
+              'Clause 2 (Immediate Mailbox Unlink): Recovery mailbox is unlinked & locked immediately following OTP issuance.',
+              'Clause 3 (Non-Refundable Delivery): Digital asset rental is final and non-refundable once credentials/OTP are accessed.',
+              'Clause 4 (Anti-Sharing Policy): Multi-device or concurrent session sharing triggers immediate permanent suspension.',
+              'Clause 5 (Sole Operational Liability): Client assumes 100% legal responsibility for gaming activities.'
+            ],
+            portalPromptText: 'By accessing or initiating transactions, you agree to our Service Terms. All rented credentials (e.g. Free Fire IDs) are provided for temporary access during specified lease hours.'
+          },
+          auditProof: termsSession ? {
+            ipAddress: termsSession.ip || null,
+            userAgent: termsSession.userAgent || null,
+            platform: termsSession.platform || null,
+            country: termsSession.country || null,
+            connectionType: termsSession.connectionType || null,
+            screenResolution: termsSession.screenResolution || null,
+            eventAction: termsSession.eventType || 'Terms Acceptance',
+            eventDetails: termsSession.details || 'Client accepted Terms & Conditions via portal prompt.',
+            sessionRecordedAt: formatFirestoreDate(termsSession.timestamp)
+          } : null
+        },
+        otpUsageStats: {
+          otpUsed: u.otpUsed === true,
+          otpScanCount: u.otpScanCount || 0,
+          lastOtpScannedAt: formatFirestoreDate(u.lastOtpScannedAt),
+          lastOtpViewedAt: formatFirestoreDate(u.lastOtpViewedAt)
+        }
+      });
+    }
+
+    if (customerResults.length === 1 && !isAll) {
+      return res.status(200).json({
+        success: true,
+        ...customerResults[0]
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      count: customerResults.length,
+      customers: customerResults
+    });
+
+  } catch (err) {
+    console.error('[API /api/customer/info] Error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'INTERNAL_SERVER_ERROR',
+      message: err.message
+    });
+  }
+};
+
+app.get('/api/customer/info', handleCustomerInfoRequest);
+app.post('/api/customer/info', handleCustomerInfoRequest);
+app.get('/api/customer-details', handleCustomerInfoRequest);
+app.post('/api/customer-details', handleCustomerInfoRequest);
+app.get('/api/terms-acceptance', handleCustomerInfoRequest);
+app.get('/api/license-info', handleCustomerInfoRequest);
+
 // Catch-all 404 for any unknown route (Scanners / Crawlers receive generic 404)
 app.use((req, res) => {
   res.status(404).send('Not Found');
